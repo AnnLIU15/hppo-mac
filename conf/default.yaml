@@ -1,0 +1,26 @@
+# 默认训练配置占位文件
+# 后续可根据真实场景在此调整环境、算法与训练超参数。
+
+seed: 42
+
+logging:
+  level: INFO
+  file: logs/train.log
+
+environment:
+  num_slots: 160
+  history_len: 4
+  total_preambles: 64
+  base_preamble_split: [ 24, 24, 16 ]
+  mac_config: default
+
+algorithm:
+  frames_per_batch: 1600
+  mini_batch_size: 64
+  max_epochs: 1000
+  clip_epsilon: 0.2
+  gamma: 0.99
+  gae_lambda: 0.95
+  actor_lr: 0.0003
+  critic_lr: 0.001
+  entropy_coeff: 0.01

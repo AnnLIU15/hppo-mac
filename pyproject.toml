@@ -1,0 +1,28 @@
+[project]
+name = "hppo-mac"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "gymnasium>=1.2.2",
+    "loguru>=0.7.2",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.7",
+    "numpy>=2.3.4",
+    "scienceplots>=2.1.1",
+    "torch>=2.9.0",
+    "torchrl>=0.10.1",
+    "tqdm>=4.67.1",
+    "pandas>=2.3.3",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.cloud.tencent.com/pypi/simple"
+default = true
+
+[dependency-groups]
+dev = [
+    "p>=1.5.0",
+    "pytest>=8.4.2",
+]
