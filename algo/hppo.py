@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from tensordict import TensorDict, TensorDictBase, TensorDictParams
 from tensordict.nn import (
     InteractionType,
     CompositeDistribution,
@@ -15,25 +16,171 @@ from tensordict.nn import (
     TensorDictSequential,
     set_composite_lp_aggregate,
 )
-from torch.distributions import Beta, OneHotCategorical
+from torch.distributions import Distribution, Normal, OneHotCategorical, constraints
 from torch.optim import Optimizer
 from torchrl.collectors import SyncDataCollector
 from torchrl.envs import TransformedEnv
 from torchrl.modules import ProbabilisticActor, ValueOperator
 from torchrl.objectives.ppo import ClipPPOLoss
-from torchrl.objectives.value import GAE
-import numpy as np
-from env.mac_simulator import MAC_PROTOCOL_COUNT, PREAMBLE_SUBSET_COUNT, HISTORY_DIM
+from env.mac_simulator import (
+    MAC_PROTOCOL_COUNT,
+    PREAMBLE_SUBSET_COUNT,
+)
 
 
 _REQUEST_FEATURE_INDICES = {"cbra": 0, "pbra": 1}
 _MAX_REQUEST_FEATURE_INDEX = max(_REQUEST_FEATURE_INDICES.values())
 _PREAMBLE_FEATURE_START = 4 + MAC_PROTOCOL_COUNT + PREAMBLE_SUBSET_COUNT
-_PREAMBLE_FEATURE_END = _PREAMBLE_FEATURE_START + 3
-_ACB_FEATURE_INDEX = _PREAMBLE_FEATURE_END
-_SUCCESS_FEATURE_INDEX = _ACB_FEATURE_INDEX + 1 + HISTORY_DIM
-_COLLISION_FEATURE_INDEX = _SUCCESS_FEATURE_INDEX + 1
+_PREAMBLE_FEATURE_END = _PREAMBLE_FEATURE_START + 2
+_ACB_FEATURE_INDEX = _PREAMBLE_FEATURE_END + 1
+
+
+def _standardize_advantage(tensor: torch.Tensor, _: Sequence[int]) -> torch.Tensor:
+    mean = tensor.mean()
+    std = tensor.std(unbiased=False)
+    std = torch.clamp(std, min=1e-8)
+    return (tensor - mean) / std
+
+
+def _sum_td_entries(td: TensorDictBase) -> torch.Tensor:
+    total: Optional[torch.Tensor] = None
+    for value in td.values():
+        total = value if total is None else total + value
+    if total is None:
+        raise ValueError("TensorDict is empty; cannot aggregate entries.")
+    return total
+
+
+def _apply_reduction(value: torch.Tensor, reduction: Optional[str]) -> torch.Tensor:
+    if reduction is None or reduction == "none":
+        return value
+    if reduction == "mean":
+        return value.mean()
+    if reduction == "sum":
+        return value.sum()
+    raise ValueError(f"Unsupported reduction mode: {reduction}")
+def _compute_gae_targets(
+    batch: TensorDictBase,
+    critic: ValueOperator,
+    *,
+    gamma: float,
+    gae_lambda: float,
+) -> TensorDictBase:
+    """Populate the batch TensorDict with GAE advantages and value targets."""
+
+    with torch.no_grad():
+        critic(batch)
+        critic(batch.get("next"))
+
+    rewards = batch.get(("next", "reward"))
+    if rewards is None:
+        raise KeyError("Missing reward tensor needed for advantage computation.")
+    rewards = rewards.squeeze(-1)
+
+    values = batch.get("state_value")
+    if values is None:
+        raise KeyError("Critic evaluation did not populate 'state_value'.")
+    values = values.squeeze(-1)
+
+    next_values = batch.get(("next", "state_value"))
+    if next_values is None:
+        raise KeyError("Critic evaluation did not populate 'next/state_value'.")
+    next_values = next_values.squeeze(-1)
+    next_values = torch.nan_to_num(next_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    done = batch.get(("next", "done"))
+    if done is None:
+        terminated = batch.get(("next", "terminated"))
+        truncated = batch.get(("next", "truncated"))
+        if terminated is None or truncated is None:
+            raise KeyError("Missing termination flags for GAE computation.")
+        done = (terminated | truncated)
+    done = done.to(dtype=values.dtype).squeeze(-1)
+
+    original_shape = values.shape
+    time_dim = values.shape[-1]
+
+    values_flat = values.reshape(-1, time_dim)
+    next_values_flat = next_values.reshape(-1, time_dim)
+    rewards_flat = rewards.reshape(-1, time_dim)
+    done_flat = done.reshape(-1, time_dim)
+
+    advantages_flat = torch.zeros_like(values_flat)
+    gae_accumulator = torch.zeros(values_flat.shape[0], dtype=values.dtype, device=values.device)
+
+    for step in range(time_dim - 1, -1, -1):
+        continuation = 1.0 - done_flat[:, step]
+        bootstrap = next_values_flat[:, step] * continuation
+        delta = rewards_flat[:, step] + bootstrap - values_flat[:, step]
+        gae_accumulator = delta + gamma * gae_lambda * continuation * gae_accumulator
+        advantages_flat[:, step] = gae_accumulator
+
+    value_targets_flat = advantages_flat + values_flat
+
+    advantages = advantages_flat.reshape(original_shape).unsqueeze(-1)
+    value_targets = value_targets_flat.reshape(original_shape).unsqueeze(-1)
+
+    batch.set("advantage", advantages)
+    batch.set("value_target", value_targets)
+    batch.set_("state_value", values.unsqueeze(-1))
+
+    return batch
+
+
+class TanhNormal01(Distribution):
+    arg_constraints: Dict[str, constraints.Constraint] = {}
+    support = constraints.interval(0.0, 1.0)
+    has_rsample = True
+
+    def __init__(self, mean: torch.Tensor, log_std: torch.Tensor, *, min_log_std: float = -20.0, max_log_std: float = 2.0) -> None:
+        self._mean = mean
+        log_std = torch.clamp(log_std, min=min_log_std, max=max_log_std)
+        self.log_std = log_std
+        std = torch.exp(log_std)
+        self._normal = Normal(mean, std)
+        batch_shape = mean.shape
+        super().__init__(batch_shape=batch_shape, event_shape=torch.Size(), validate_args=False)
+
+    @staticmethod
+    def _atanh(x: torch.Tensor) -> torch.Tensor:
+        eps = torch.finfo(x.dtype).eps
+        x = torch.clamp(x, -1.0 + eps, 1.0 - eps)
+        return 0.5 * (torch.log1p(x) - torch.log1p(-x))
+
+    def _transform(self, sample: torch.Tensor) -> torch.Tensor:
+        return (torch.tanh(sample) + 1.0) * 0.5
+
+    def rsample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        base = self._normal.rsample(sample_shape)
+        return self._transform(base)
+
+    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        base = self._normal.sample(sample_shape)
+        return self._transform(base)
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        eps = torch.finfo(value.dtype).eps
+        value = torch.clamp(value, eps, 1.0 - eps)
+        tanh_value = value * 2.0 - 1.0
+        pre_tanh = self._atanh(tanh_value)
+        log_prob = self._normal.log_prob(pre_tanh)
+        jacobian = torch.clamp(1.0 - tanh_value.pow(2), min=eps)
+        log_det = torch.log(jacobian) - math.log(2.0)
+        return log_prob - log_det
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self._transform(self._mean)
+
+
 _PREAMBLE_KEYS = ("cbra", "pbra", "cfra")
+
+
+def _kaiming_init(module: nn.Module) -> None:
+    if isinstance(module, nn.Linear):
+        nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 
 class _PolicyParamExtractor(nn.Module):
@@ -43,7 +190,6 @@ class _PolicyParamExtractor(nn.Module):
         super().__init__()
         self.combo_head = nn.Linear(feature_dim, combo_bins)
         self.mask_penalty = float(mask_penalty)
-        # Shared head emits raw alpha/beta scores for the Beta distribution.
         self.acb_head = nn.Linear(feature_dim, 2)
 
     def forward(
@@ -57,12 +203,17 @@ class _PolicyParamExtractor(nn.Module):
             while mask.ndim < logits_combo.ndim:
                 mask = mask.unsqueeze(0)
             mask = mask.expand_as(logits_combo)
+            valid_mask = mask > 0.5
+            has_valid = valid_mask.any(dim=-1, keepdim=True)
+            if not torch.all(has_valid):
+                fallback = torch.ones_like(valid_mask, dtype=torch.bool)
+                valid_mask = torch.where(has_valid, valid_mask, fallback)
             penalty = torch.full_like(logits_combo, self.mask_penalty)
-            logits_combo = torch.where(mask > 0.5, logits_combo, penalty)
-        acb_raw = self.acb_head(features)
-        alpha = F.softplus(acb_raw[..., :1]) + 1.0
-        beta = F.softplus(acb_raw[..., 1:2]) + 1.0
-        return logits_combo, alpha, beta
+            logits_combo = torch.where(valid_mask, logits_combo, penalty)
+        # logits_combo = torch.clamp(logits_combo, min=-50.0, max=50.0)
+        acb_params = self.acb_head(features)
+        acb_mean, acb_log_std = acb_params.chunk(2, dim=-1)
+        return logits_combo, acb_mean, acb_log_std
 
 
 class _FeatureEncoder(nn.Module):
@@ -115,6 +266,238 @@ class HPPOConfig:
     device: Optional[torch.device] = None
 
 
+class SplitHeadClipPPOLoss(ClipPPOLoss):
+    """PPO loss that treats each composite action head independently before aggregation."""
+
+    actor_network: TensorDictModule
+    critic_network: TensorDictModule
+    actor_network_params: TensorDictParams
+    critic_network_params: TensorDictParams
+    target_actor_network_params: TensorDictParams
+    target_critic_network_params: TensorDictParams
+
+    def __init__(
+        self,
+        *args,
+        head_keys: Optional[Sequence[str]] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._head_keys: Optional[tuple[str, ...]] = tuple(head_keys) if head_keys is not None else None
+
+    @staticmethod
+    def _normalized_head_log_probs(log_prob_td: TensorDictBase) -> TensorDict:
+        """Return a TensorDict whose keys map cleanly to action head names."""
+
+        entries = {}
+        for key in log_prob_td.keys():
+            value = log_prob_td.get(key)
+            if isinstance(key, str) and key.endswith("_log_prob"):
+                key = key[: -len("_log_prob")]
+            entries[key] = value
+        return TensorDict(
+            entries,
+            batch_size=log_prob_td.batch_size,
+            device=log_prob_td.device,
+        )
+
+    def forward(self, tensordict: TensorDictBase) -> TensorDict:
+        tensordict = tensordict.clone(False)
+
+        advantage = tensordict.get(self.tensor_keys.advantage, None)
+        if advantage is None:
+            if self.critic_network is None:
+                raise RuntimeError("Critic network is required to compute the advantage internally.")
+            self.value_estimator(
+                tensordict,
+                params=self._cached_critic_network_params_detached,
+                target_params=self.target_critic_network_params,
+            )
+            advantage = tensordict.get(self.tensor_keys.advantage)
+        if advantage is None:
+            raise KeyError(f"Missing advantage tensor at key {self.tensor_keys.advantage}.")
+
+        if self.normalize_advantage and advantage.numel() > 1:
+            advantage = _standardize_advantage(advantage, self.normalize_advantage_exclude_dims)
+
+        previous_log_prob = tensordict.get("sample_log_prob")
+        if previous_log_prob is None:
+            log_prob_entries: Dict[str, torch.Tensor] = {}
+            for key in tensordict.keys():
+                if isinstance(key, str) and key.endswith("_log_prob"):
+                    head_name = key[: -len("_log_prob")]
+                    value = tensordict.get(key)
+                    if value is not None:
+                        log_prob_entries[head_name] = value
+            if log_prob_entries:
+                previous_log_prob = TensorDict(log_prob_entries, batch_size=tensordict.batch_size)
+        if previous_log_prob is None:
+            raise KeyError(f"Missing stored log-probs at key {self.tensor_keys.sample_log_prob}.")
+
+        with set_composite_lp_aggregate(False):
+            current_log_prob, dist, _ = self._get_cur_log_prob(tensordict)
+
+        if isinstance(previous_log_prob, TensorDictBase):
+            previous_log_prob = self._normalized_head_log_probs(previous_log_prob)
+        if isinstance(current_log_prob, TensorDictBase):
+            current_log_prob = self._normalized_head_log_probs(current_log_prob)
+
+        if not isinstance(previous_log_prob, TensorDictBase) or not isinstance(current_log_prob, TensorDictBase):
+            # Fallback to default PPO behaviour if composite heads are unavailable.
+            return super().forward(tensordict)
+
+        head_keys = self._head_keys or tuple(previous_log_prob.keys())
+        clip_bounds = self._clip_bounds
+
+        losses, log_weight_stack, kl_terms = [], [], []
+        clip_fractions = []
+
+        for key in head_keys:
+            new_lp = current_log_prob.get(key)
+            old_lp = previous_log_prob.get(key)
+            if new_lp is None or old_lp is None:
+                raise KeyError(f"Log-prob tensor for head '{key}' is missing.")
+
+            if not torch.isfinite(new_lp).all() or not torch.isfinite(old_lp).all():
+                stats = {
+                    "new_nan": torch.isnan(new_lp).sum().item(),
+                    "new_pos_inf": torch.isposinf(new_lp).sum().item(),
+                    "new_neg_inf": torch.isneginf(new_lp).sum().item(),
+                    "old_nan": torch.isnan(old_lp).sum().item(),
+                    "old_pos_inf": torch.isposinf(old_lp).sum().item(),
+                    "old_neg_inf": torch.isneginf(old_lp).sum().item(),
+                }
+                logits = tensordict.get(("params", key, "logits"), None)
+                logits_stats = None
+                if isinstance(logits, torch.Tensor):
+                    logits_stats = {
+                        "logits_nan": torch.isnan(logits).sum().item(),
+                        "logits_pos_inf": torch.isposinf(logits).sum().item(),
+                        "logits_neg_inf": torch.isneginf(logits).sum().item(),
+                        "logits_min": float(logits.nan_to_num().min().detach().cpu().item()),
+                        "logits_max": float(logits.nan_to_num().max().detach().cpu().item()),
+                    }
+                observation_stats = None
+                obs = tensordict.get("observation", None)
+                if isinstance(obs, torch.Tensor):
+                    observation_stats = {
+                        "obs_nan": torch.isnan(obs).sum().item(),
+                        "obs_pos_inf": torch.isposinf(obs).sum().item(),
+                        "obs_neg_inf": torch.isneginf(obs).sum().item(),
+                        "obs_min": float(obs.nan_to_num().min().detach().cpu().item()),
+                        "obs_max": float(obs.nan_to_num().max().detach().cpu().item()),
+                    }
+                raise RuntimeError(
+                    f"Non-finite log-prob detected for head '{key}' with stats {stats}, logits_stats {logits_stats}, observation_stats {observation_stats}."
+                )
+
+            # Collapse potential event dimensions so each head operates on scalar log-probs.
+            new_lp = new_lp.reshape(new_lp.shape[0], -1).sum(dim=-1)
+            old_lp = old_lp.reshape(old_lp.shape[0], -1).sum(dim=-1)
+
+            log_weight_scalar = new_lp - old_lp
+            if torch.isfinite(log_weight_scalar).all():
+                if (log_weight_scalar > 10000).any() or (log_weight_scalar < -10000).any():
+                    raise RuntimeError(
+                        f"Log-weight overflow for head '{key}'",
+                        {
+                            "max_log_weight": float(log_weight_scalar.max().detach().cpu().item()),
+                            "min_log_weight": float(log_weight_scalar.min().detach().cpu().item()),
+                            "max_new_lp": float(new_lp.max().detach().cpu().item()),
+                            "min_new_lp": float(new_lp.min().detach().cpu().item()),
+                            "max_old_lp": float(old_lp.max().detach().cpu().item()),
+                            "min_old_lp": float(old_lp.min().detach().cpu().item()),
+                        },
+                    )
+
+            log_weight = log_weight_scalar.unsqueeze(-1)
+            log_weight_stack.append(log_weight)
+
+            ratio = log_weight.exp()
+            ratio_clipped = log_weight.clamp(*clip_bounds).exp()
+            gain_candidates = torch.stack((ratio * advantage, ratio_clipped * advantage), dim=-1)
+            losses.append(-gain_candidates.min(dim=-1).values)
+
+            clip_flag = (log_weight.clamp(*clip_bounds) != log_weight).to(log_weight.dtype)
+            clip_fractions.append(clip_flag.mean())
+
+            kl_terms.append((old_lp - new_lp).unsqueeze(-1))
+
+        loss_objective = torch.stack(losses, dim=-1).sum(dim=-1)
+        clip_fraction_value = float(torch.stack(clip_fractions).mean().detach().cpu())
+        clip_fraction = loss_objective.new_full(
+            loss_objective.shape,
+            clip_fraction_value,
+        )
+        kl_total = torch.stack(kl_terms, dim=-1).sum(dim=-1)
+
+        td_out = TensorDict({"loss_objective": loss_objective})
+        td_out.set("clip_fraction", clip_fraction)
+        td_out.set("kl_approx", kl_total.detach())
+
+        if self.entropy_bonus:
+            entropy = self._get_entropy(dist, adv_shape=advantage.shape[:-1])
+            if isinstance(entropy, TensorDictBase):
+                td_out.set("composite_entropy", entropy.detach())
+                entropy_tensor = _sum_td_entries(entropy).detach()
+            else:
+                entropy_tensor = entropy.detach()
+            entropy_tensor = entropy_tensor.reshape(entropy_tensor.shape[0], -1).mean(dim=-1, keepdim=True)
+            td_out.set("entropy", entropy_tensor)
+            td_out.set("loss_entropy", self._weighted_loss_entropy(entropy))
+
+        if self._has_critic:
+            loss_critic, value_clip_fraction, explained_variance = self.loss_critic(tensordict)
+            td_out.set("loss_critic", loss_critic)
+            if value_clip_fraction is not None:
+                if value_clip_fraction.shape[: len(tensordict.batch_size)] != tensordict.batch_size:
+                    value_clip_fraction = float(value_clip_fraction.detach().mean().cpu())
+                    value_clip_fraction = loss_objective.new_full(
+                        loss_objective.shape,
+                        value_clip_fraction,
+                    )
+                td_out.set("value_clip_fraction", value_clip_fraction)
+            if explained_variance is not None:
+                if explained_variance.shape[: len(tensordict.batch_size)] != tensordict.batch_size:
+                    explained_variance = float(explained_variance.detach().mean().cpu())
+                    explained_variance = loss_objective.new_full(
+                        loss_objective.shape,
+                        explained_variance,
+                    )
+                td_out.set("explained_variance", explained_variance)
+
+        if log_weight_stack:
+            with torch.no_grad():
+                summed_log_weight = torch.stack([lw.squeeze(-1) for lw in log_weight_stack], dim=-1).sum(dim=-1)
+                lw_flat = summed_log_weight.reshape(-1)
+                ess = (2 * lw_flat.logsumexp(0) - (2 * lw_flat).logsumexp(0)).exp()
+                batch = summed_log_weight.shape[0]
+                ess_value = float((ess / batch).detach().cpu())
+                ess_tensor = loss_objective.new_full(
+                    loss_objective.shape,
+                    ess_value,
+                )
+                td_out.set("ESS", ess_tensor)
+        else:
+            td_out.set("ESS", torch.zeros_like(loss_objective))
+
+        td_out = td_out.named_apply(
+            lambda name, value: _apply_reduction(value, self.reduction)
+            if name.startswith("loss_")
+            else value,
+        )
+
+        self._clear_weakrefs(
+            tensordict,
+            td_out,
+            "actor_network_params",
+            "critic_network_params",
+            "target_actor_network_params",
+            "target_critic_network_params",
+        )
+        return td_out
+
+
 def build_hppo_modules(
     env: TransformedEnv,
     *,
@@ -125,7 +508,6 @@ def build_hppo_modules(
     observation_spec = env.observation_spec["observation"]
     action_spec = env.action_spec
     obs_dim = observation_spec.shape[-1]
-
     combo_spec = action_spec.get("delta_combo")
     if combo_spec is None:
         raise KeyError("Combined RA delta head `delta_combo` missing from action spec.")
@@ -135,25 +517,29 @@ def build_hppo_modules(
     except AttributeError as err:
         raise ValueError("Discrete heads must expose a categorical cardinality via `space.n`.") from err
 
+    feature_encoder = _FeatureEncoder(obs_dim, feature_dim)
+    feature_encoder.apply(_kaiming_init)
     actor_encoder = TensorDictModule(
-        _FeatureEncoder(obs_dim, feature_dim),
+        feature_encoder,
         in_keys=["observation"],
         out_keys=["state_feature"],
     )
+    param_extractor = _PolicyParamExtractor(feature_dim, combo_bins)
+    param_extractor.apply(_kaiming_init)
     policy_params = TensorDictModule(
-        _PolicyParamExtractor(feature_dim, combo_bins),
+        param_extractor,
         in_keys=["state_feature", ("info", "delta_combo_mask")],
         out_keys=[
             ("params", "delta_combo", "logits"),
-            ("params", "q_ACB", "concentration1"),
-            ("params", "q_ACB", "concentration0"),
+            ("params", "q_ACB", "mean"),
+            ("params", "q_ACB", "log_std"),
         ],
     )
 
     policy_td = TensorDictSequential(actor_encoder, policy_params)
 
-    # Ensure log-probs from composite distribution aggregate across heads.
-    set_composite_lp_aggregate(True)
+    # Keep per-head log-prob components to facilitate split PPO losses.
+    set_composite_lp_aggregate(False)
 
     actor = ProbabilisticActor(
         module=policy_td,
@@ -163,7 +549,7 @@ def build_hppo_modules(
         distribution_kwargs={
             "distribution_map": {
                 "delta_combo": OneHotCategorical,
-                "q_ACB": Beta,
+                "q_ACB": TanhNormal01,
             }
         },
         default_interaction_type=InteractionType.RANDOM,
@@ -172,7 +558,7 @@ def build_hppo_modules(
 
     critic = ValueOperator(
         module=TensorDictModule(
-            _CriticNetwork(obs_dim, feature_dim),
+            _CriticNetwork(obs_dim, feature_dim).apply(_kaiming_init),
             in_keys=["observation"],
             out_keys=["state_value"],
         ),
@@ -215,20 +601,14 @@ def train_hppo(
         device=device,
     )
 
-    advantage = GAE(
-        gamma=config.gamma,
-        lmbda=config.gae_lambda,
-        value_network=critic,
-        average_gae=False,
-    )
-
-    loss_module = ClipPPOLoss(
+    loss_module = SplitHeadClipPPOLoss(
         actor_network=actor,
         critic_network=critic,
         clip_epsilon=config.clip_epsilon,
         entropy_bonus=True,
         entropy_coeff=config.entropy_coeff,
         normalize_advantage=True,
+        head_keys=("delta_combo", "q_ACB"),
     )
 
     actor_opt, critic_opt = _prepare_optimizers(actor, critic, config)
@@ -240,7 +620,12 @@ def train_hppo(
             break
 
         with torch.no_grad():
-            batch = advantage(batch)
+            batch = _compute_gae_targets(
+                batch,
+                critic,
+                gamma=config.gamma,
+                gae_lambda=config.gae_lambda,
+            )
 
         train_batch = batch.view(-1)
         train_batch = train_batch.to(device)
@@ -260,7 +645,24 @@ def train_hppo(
 
                 critic_term = losses_td.get("loss_critic")
                 if isinstance(critic_term, torch.Tensor):
+                    # critic_term = torch.clamp(critic_term, max=100.0)
                     total_loss = total_loss + critic_term
+
+                if not torch.isfinite(total_loss).all():
+                    objective = losses_td.get("loss_objective")
+                    entropy_loss = losses_td.get("loss_entropy")
+                    critic_loss = losses_td.get("loss_critic")
+                    raise RuntimeError(
+                        "Encountered non-finite total loss",
+                        {
+                            "loss_objective_nan": 0 if not isinstance(objective, torch.Tensor) else int(torch.isnan(objective).sum().item()),
+                            "loss_objective_inf": 0 if not isinstance(objective, torch.Tensor) else int(torch.isinf(objective).sum().item()),
+                            "loss_entropy_nan": 0 if not isinstance(entropy_loss, torch.Tensor) else int(torch.isnan(entropy_loss).sum().item()),
+                            "loss_entropy_inf": 0 if not isinstance(entropy_loss, torch.Tensor) else int(torch.isinf(entropy_loss).sum().item()),
+                            "loss_critic_nan": 0 if not isinstance(critic_loss, torch.Tensor) else int(torch.isnan(critic_loss).sum().item()),
+                            "loss_critic_inf": 0 if not isinstance(critic_loss, torch.Tensor) else int(torch.isinf(critic_loss).sum().item()),
+                        },
+                    )
 
                 actor_opt.zero_grad()
                 critic_opt.zero_grad()
@@ -271,7 +673,10 @@ def train_hppo(
                 scalar_metrics = {}
                 for key, value in losses_td.items():
                     if isinstance(value, torch.Tensor):
-                        scalar_metrics[key] = float(value.detach().cpu())
+                        reduced = value
+                        if reduced.numel() > 1:
+                            reduced = reduced.mean()
+                        scalar_metrics[key] = float(reduced.detach().cpu())
                 metrics = scalar_metrics
         collector.update_policy_weights_()
 
@@ -284,13 +689,49 @@ def train_hppo(
             obs_tensor = batch.get(("next", "observation"))
         except KeyError:
             obs_tensor = None
-
         if isinstance(obs_tensor, torch.Tensor):
             feature_dim = obs_tensor.shape[-1]
             flat_obs = obs_tensor.reshape(-1, feature_dim)
-            if feature_dim > _COLLISION_FEATURE_INDEX:
-                success_vals = flat_obs[:, _SUCCESS_FEATURE_INDEX]
-                collision_vals = flat_obs[:, _COLLISION_FEATURE_INDEX]
+            if feature_dim > _ACB_FEATURE_INDEX:
+                acb_vals = flat_obs[:, _ACB_FEATURE_INDEX]
+                acb_mean = float(acb_vals.mean().detach().cpu().item())
+                metrics = {**metrics, "acb_mean": acb_mean}
+            if feature_dim > _MAX_REQUEST_FEATURE_INDEX:
+                request_means = {
+                    f"r_{key}": float(flat_obs[:, idx].mean().detach().cpu().item())
+                    for key, idx in _REQUEST_FEATURE_INDICES.items()
+                }
+                metrics = {**metrics, **request_means}
+            if feature_dim > _PREAMBLE_FEATURE_END:
+                preamble_means = {
+                    f"p_{key}": float(
+                        flat_obs[:, _PREAMBLE_FEATURE_START + i][:-1].mean().detach().cpu().item()
+                    )
+                    for i, key in enumerate(_PREAMBLE_KEYS)
+                }
+                metrics = {**metrics, **preamble_means}
+
+        info_td: Optional[TensorDictBase]
+        try:
+            info_td = batch.get(("next", "info"))
+        except KeyError:
+            info_td = None
+        if isinstance(info_td, TensorDictBase):
+            success_parts = []
+            collision_parts = []
+            for key in ("success_cbra", "success_pbra", "success_cfra"):
+                value = info_td.get(key, None)
+                if isinstance(value, torch.Tensor):
+                    success_parts.append(value.to(dtype=torch.float32))
+            for key in ("collision_cbra", "collision_pbra", "collision_cfra"):
+                value = info_td.get(key, None)
+                if isinstance(value, torch.Tensor):
+                    collision_parts.append(value.to(dtype=torch.float32))
+            if success_parts and collision_parts:
+                success_tensor = torch.stack(success_parts, dim=0).sum(dim=0)
+                collision_tensor = torch.stack(collision_parts, dim=0).sum(dim=0)
+                success_vals = success_tensor.reshape(-1)
+                collision_vals = collision_tensor.reshape(-1)
                 success_mean = float(success_vals.mean().detach().cpu().item())
                 collision_mean = float(collision_vals.mean().detach().cpu().item())
                 denom = success_mean + collision_mean
@@ -302,29 +743,12 @@ def train_hppo(
                     collision_rate = 0.0
                 metrics = {
                     **metrics,
-                    "success_total_mean": success_mean,
-                    "collision_total_mean": collision_mean,
-                    "success_rate": success_rate,
-                    "collision_rate": collision_rate,
+                    "succ_total": success_mean,
+                    "coll_total": collision_mean,
+                    "succ_rate": success_rate,
+                    "coll_rate": collision_rate,
                 }
-            if feature_dim > _ACB_FEATURE_INDEX:
-                acb_vals = flat_obs[:, _ACB_FEATURE_INDEX]
-                acb_mean = float(acb_vals.mean().detach().cpu().item())
-                metrics = {**metrics, "acb_factor_mean": acb_mean}
-            if feature_dim >= _PREAMBLE_FEATURE_END:
-                preamble_slice = flat_obs[:, _PREAMBLE_FEATURE_START:_PREAMBLE_FEATURE_END]
-                slice_mean = preamble_slice.mean(dim=0)
-                preamble_means = {
-                    f"preamble_{key}": np.round(value.detach().cpu().item() * 64)
-                    for key, value in zip(_PREAMBLE_KEYS, slice_mean)
-                }
-                metrics = {**metrics, **preamble_means}
-            if feature_dim > _MAX_REQUEST_FEATURE_INDEX:
-                request_means = {
-                    f"requests_{key}": float(flat_obs[:, idx].mean().detach().cpu().item())
-                    for key, idx in _REQUEST_FEATURE_INDICES.items()
-                }
-                metrics = {**metrics, **request_means}
+
 
         if logger_fn:
             log_payload = {
@@ -333,11 +757,11 @@ def train_hppo(
                 **metrics,
             }
             if success_rate is not None and "success_rate" not in log_payload:
-                log_payload["success_rate"] = success_rate
+                log_payload["succe_rate"] = success_rate
             if collision_rate is not None and "collision_rate" not in log_payload:
-                log_payload["collision_rate"] = collision_rate
+                log_payload["coll_rate"] = collision_rate
             if acb_mean is not None and "acb_factor_mean" not in log_payload:
-                log_payload["acb_factor_mean"] = acb_mean
+                log_payload["acb_mean"] = acb_mean
             if preamble_means is not None:
                 for key, value in preamble_means.items():
                     if key not in log_payload:

@@ -29,15 +29,16 @@ def _wrap_env(config: SatelliteMACEnvConfig, seed: Optional[int]) -> GymWrapper:
 def _make_env(
     config: SatelliteMACEnvConfig,
     device: torch.device,
-    seed: int,
+    seed: Optional[int],
     num_envs: int,
     backend: str,
 ) -> TransformedEnv:
     if num_envs <= 1:
         base_env = _wrap_env(config, seed)
     else:
-        def _factory(rank: int) -> GymWrapper:
-            env_seed = seed + rank if seed is not None else None
+        def _factory(rank: Optional[int] = None) -> GymWrapper:
+            seed_offset = rank if rank is not None else 0
+            env_seed = seed + seed_offset if seed is not None else None
             return _wrap_env(config, env_seed)
 
         if backend == "parallel":
@@ -130,7 +131,7 @@ def _configure_logging(log_path: Optional[Path]) -> None:
     if log_path is None:
         return
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.add(log_path, level="INFO", enqueue=True, rotation="5 MB")
+    logger.add(log_path, level="INFO", enqueue=True, rotation="10 MB")
 
 
 def _build_logger_callback() -> Callable[..., None]:
@@ -150,7 +151,8 @@ def _build_logger_callback() -> Callable[..., None]:
 def main() -> None:
     args = _parse_args()
 
-    torch.manual_seed(args.seed)
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
 
     log_path = Path(args.log_file) if args.log_file else None
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else None
@@ -172,7 +174,7 @@ def main() -> None:
             num_envs,
         )
 
-    logger.info("Using %s env backend with %d replicas", env_backend, num_envs)
+    logger.info(f"Using {env_backend} env backend with {num_envs} replicas")
     env = _make_env(env_config, device, args.seed, num_envs, env_backend)
     actor, critic = build_hppo_modules(env, feature_dim=args.feature_dim)
 

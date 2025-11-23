@@ -9,7 +9,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 from gymnasium.utils import seeding
-
+from loguru import logger
 from .mac_simulator import (
     MACSimulator,
     MACSimulatorConfig,
@@ -52,8 +52,6 @@ class SatelliteMACEnv(gym.Env):
             "requests_pbra",
             "collision_ratio_cbra",
             "collision_ratio_pbra",
-            "success_total",
-            "collision_total",
             "pending_backoff_cbra",
             "pending_backoff_pbra",
         )
@@ -104,8 +102,6 @@ class SatelliteMACEnv(gym.Env):
                     "preamble_allocation": spaces.Box(low=0.0, high=1.0, shape=(3,), dtype=np.float32),
                     "current_ACB_factor": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
                     "history_stats": spaces.Box(low=-np.inf, high=np.inf, shape=(HISTORY_DIM,), dtype=np.float32),
-                    "success_total": spaces.Box(low=0.0, high=inf, shape=(1,), dtype=np.float32),
-                    "collision_total": spaces.Box(low=0.0, high=inf, shape=(1,), dtype=np.float32),
                     "pending_backoff_cbra": spaces.Box(low=0.0, high=inf, shape=(1,), dtype=np.float32),
                     "pending_backoff_pbra": spaces.Box(low=0.0, high=inf, shape=(1,), dtype=np.float32),
                     "region_mixture": spaces.Box(low=0.0, high=1.0, shape=(self._region_count,), dtype=np.float32),
@@ -136,6 +132,7 @@ class SatelliteMACEnv(gym.Env):
             self._np_random, _ = seeding.np_random(seed)
         self.simulator.reseed(seed)
         self.simulator.reset_access_allocation()
+        self.simulator._reset_coverage_position()
         self._step_count = 0
         observation_dict = self.simulator.initialize_state(seed)
         self._init_history_buffer(observation_dict)
@@ -155,6 +152,7 @@ class SatelliteMACEnv(gym.Env):
         """执行一步决策。"""
 
         parsed_action = self._parse_action(action)
+        # logger.info(f'parsed_action {parsed_action}')
         reward, next_state, sim_info = self.simulator.run_slots(
             num_slots=self.config.num_slots_per_step,
             params=parsed_action,
@@ -215,7 +213,6 @@ class SatelliteMACEnv(gym.Env):
             idx = int(values.item())
         else:
             raise ValueError("无法解析给定的组合动作分量。")
-
         idx = int(np.clip(idx, 0, self._combo_count - 1))
         delta_cbra, delta_pbra = self._delta_pairs[idx]
         return float(delta_cbra), float(delta_pbra)
@@ -291,8 +288,6 @@ class SatelliteMACEnv(gym.Env):
         add_component("preamble_allocation", 3, 0.0, 1.0)
         add_component("current_ACB_factor", 1, 0.0, 1.0)
         add_component("history_stats", HISTORY_DIM, -np.inf, np.inf)
-        add_component("success_total", 1, 0.0, inf)
-        add_component("collision_total", 1, 0.0, inf)
         add_component("pending_backoff_cbra", 1, 0.0, inf)
         add_component("pending_backoff_pbra", 1, 0.0, inf)
         add_component("region_mixture", self._region_count, 0.0, 1.0)
@@ -304,8 +299,6 @@ class SatelliteMACEnv(gym.Env):
             "requests_pbra": (0.0, inf),
             "collision_ratio_cbra": (0.0, 1.0),
             "collision_ratio_pbra": (0.0, 1.0),
-            "success_total": (0.0, inf),
-            "collision_total": (0.0, inf),
             "pending_backoff_cbra": (0.0, inf),
             "pending_backoff_pbra": (0.0, inf),
         }
@@ -339,8 +332,6 @@ class SatelliteMACEnv(gym.Env):
         vectors.append(np.asarray(observation["preamble_allocation"], dtype=np.float32).reshape(-1))
         vectors.append(np.asarray(observation["current_ACB_factor"], dtype=np.float32).reshape(-1))
         vectors.append(np.asarray(observation["history_stats"], dtype=np.float32).reshape(-1))
-        vectors.append(np.asarray(observation["success_total"], dtype=np.float32).reshape(-1))
-        vectors.append(np.asarray(observation["collision_total"], dtype=np.float32).reshape(-1))
         vectors.append(np.asarray(observation["pending_backoff_cbra"], dtype=np.float32).reshape(-1))
         vectors.append(np.asarray(observation["pending_backoff_pbra"], dtype=np.float32).reshape(-1))
         vectors.append(np.asarray(observation["region_mixture"], dtype=np.float32).reshape(-1))

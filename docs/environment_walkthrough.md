@@ -55,7 +55,7 @@ Setting `flatten_observation=False` exposes the same content as a `spaces.Dict`,
 - `q_ACB`: beta-distributed scalar where the actor outputs positive concentration parameters; the environment clips final values into `[0, 1]` before forwarding to the simulator.
 
 ## History and Diagnostics
-- `_recent_stats` maintains a FIFO buffer of the last `history_len` rows for eight key statistics (`requests_*`, `collision_ratio_*`, `success_total`, `collision_total`, `pending_backoff_*`).
+- `_recent_stats` maintains a FIFO buffer of the last `history_len` rows for six key statistics (`requests_*`, `collision_ratio_*`, `pending_backoff_*`).
 - The simulator stores a `history` ring buffer of past rewards inside its state, also surfaced through the observation.
 - Extensive diagnostics are provided through the `info` dict in both the simulator and environment layers, enabling offline analysis (`main.py` and `scripts/plot_telemetry.py` rely on the same fields).
 

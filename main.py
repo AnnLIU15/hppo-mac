@@ -289,7 +289,7 @@ def build_env_config(
     flatten_observation: bool = False,
 ) -> SatelliteMACEnvConfig:
     return SatelliteMACEnvConfig(
-        num_slots_per_step=1,
+        num_slots_per_step=800,
         decision_horizon=decision_horizon,
         history_len=8,
         preamble_delta_range=delta_range,
@@ -376,14 +376,15 @@ def main() -> None:
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    sim_config = build_simulator_config(
-        medium_threshold=0.08,
-        high_threshold=0.15,
-        low_window=(0, 6),
-        medium_window=(3, 14),
-        high_window=(8, 28),
-        max_backoff=48,
-    )
+    sim_config = default_simulator_config()
+    # build_simulator_config(
+    #     medium_threshold=0.08,
+    #     high_threshold=0.15,
+    #     low_window=(0, 6),
+    #     medium_window=(3, 14),
+    #     high_window=(8, 28),
+    #     max_backoff=48,
+    # )
     env_config = build_env_config(
         delta_range=3,
         decision_horizon=256,

@@ -1,335 +1,204 @@
-"""MAC 接入仿真占位实现。
-
-该模块主要提供 ``MACSimulator`` 类，用于在强化学习环境中模拟
-LEO 卫星的随机接入流量、切换事件与 MAC 反馈。目前实现为占位逻辑，
-通过可配置的统计特征生成观测、奖励与调度信息，便于后续替换为
-高保真模型。
-"""
+"""Simplified regional MAC simulator tailored to the linear coverage scenario."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from utils.traffic import (
-    BatchedPoissonConfig,
-    CoxProcessConfig,
-    batched_poisson_arrival,
-    generate_cox_points,
-    sample_residence_time,
-)
+# --- Public constants exposed to the environment and policy stacks -----------------
 
-# 默认观测维度常量，占位值可在后续阶段根据真实模型调整。
-MAC_PROTOCOL_COUNT = 4
+MAC_PROTOCOL_COUNT = 3  # CBRA, PBRA, CFRA
 PREAMBLE_SUBSET_COUNT = 8
-HISTORY_DIM = 10
 DEFAULT_TOTAL_PREAMBLES = 64
 
+_STAT_KEYS = (
+    "requests_cbra",
+    "requests_pbra",
+    "collision_ratio_cbra",
+    "collision_ratio_pbra",
+    "pending_backoff_cbra",
+    "pending_backoff_pbra",
+)
+DEFAULT_HISTORY_SIZE = 10
+HISTORY_DIM = DEFAULT_HISTORY_SIZE * len(_STAT_KEYS)
 
-@dataclass(frozen=True)
-class RegionTrafficProfile:
-    """区域流量画像。
-
-    Attributes:
-        name: 区域名称，用于日志记录。
-        area_weight: 区域覆盖权重，归一化后用于采样区域。
-        cbra_density: CBRA 小包接入的基线密度。
-        pbra_density: PBRA 小包接入的基线密度。
-        handover_intensity: 切换用户的基线强度（非竞争接入）。
-        scheduling_period: 定期调度周期（以接入时隙为单位）。
-        noise_scale: 叠加随机扰动的尺度，模拟人口进出的小尺度波动。
-    cox_intensity_mean: Cox 过程的平均强度，决定空间热点水平。
-    cox_intensity_variance: Cox 过程强度波动幅度。
-    cox_grid: 生成 Cox 网格的形状，控制空间分辨率。
-    region_bounds: 区域边界矩形，用于生成空间热点。
-    batch_mean: 批量泊松过程的平均批量大小。
-    batch_std: 批量泊松过程的批量标准差。
-    residence_time_mean: 平均驻留时间，用于调节需求放大系数。
-    """
-
-    name: str
-    area_weight: float
-    cbra_density: float
-    pbra_density: float
-    handover_intensity: float
-    scheduling_period: int
-    noise_scale: float = 0.1
-    cox_intensity_mean: float = 1.0
-    cox_intensity_variance: float = 0.5
-    cox_grid: Tuple[int, int] = (6, 6)
-    region_bounds: Tuple[float, float, float, float] = (-1.0, 1.0, -1.0, 1.0)
-    batch_mean: float = 5.0
-    batch_std: float = 0.5
-    residence_time_mean: float = 5.0
-
-
-@dataclass(frozen=True)
-class CoveragePatch:
-    """描述轨道覆盖范围中一个网格块的区域混合权重。"""
-
-    name: str
-    center: Tuple[float, float]
-    radius: float
-    strength: float
-    region_weights: Tuple[float, ...]
+# --- Dataclasses describing the simulator configuration ---------------------------
 
 
 @dataclass(frozen=True)
 class BackoffWindow:
-    """描述退避范围的上下界（以决策步为单位）。"""
+    """Lower/upper bounds for the backoff delay (inclusive)."""
 
     min_steps: int
     max_steps: int
 
+    def __post_init__(self) -> None:
+        if self.min_steps < 0 or self.max_steps < self.min_steps:
+            raise ValueError("Invalid backoff window")
+
 
 @dataclass(frozen=True)
 class BackoffStrategyConfig:
-    """随机退避策略配置。"""
+    """Grouping of adaptive windows driven by collision ratios."""
 
-    low: BackoffWindow = field(default_factory=lambda: BackoffWindow(0, 4))
-    medium: BackoffWindow = field(default_factory=lambda: BackoffWindow(1, 12))
-    high: BackoffWindow = field(default_factory=lambda: BackoffWindow(6, 24))
-    collision_threshold_medium: float = 0.05
-    collision_threshold_high: float = 0.1
-    max_backlog_steps: int = 48
+    low: BackoffWindow
+    medium: BackoffWindow
+    high: BackoffWindow
+    collision_threshold_medium: float
+    collision_threshold_high: float
+    max_backlog_steps: int
+
+    def __post_init__(self) -> None:
+        if self.max_backlog_steps <= 0:
+            raise ValueError("max_backlog_steps must be positive")
+
+
+@dataclass(frozen=True)
+class RegionTrafficProfile:
+    """Per-category density template across the linear corridor."""
+
+    name: str
+    cbra_density: float
+    pbra_density: float
+    cfra_density: float
+
+    def __post_init__(self) -> None:
+        if min(self.cbra_density, self.pbra_density, self.cfra_density) < 0.0:
+            raise ValueError("Region densities must be non-negative")
+
+
+@dataclass(frozen=True)
+class RegionSegment:
+    """Contiguous linear segment mapped to a region category."""
+
+    region_name: str
+    length: float
+
+    def __post_init__(self) -> None:
+        if self.length <= 0.0:
+            raise ValueError("Segment length must be positive")
+
+
+def _default_backoff_strategy() -> BackoffStrategyConfig:
+    return BackoffStrategyConfig(
+        low=BackoffWindow(0, 4),
+        medium=BackoffWindow(2, 10),
+        high=BackoffWindow(6, 18),
+        collision_threshold_medium=0.08,
+        collision_threshold_high=0.16,
+        max_backlog_steps=48,
+    )
+
+
+def _default_reward_weights() -> Dict[str, float]:
+    return {"throughput": 1.0, "collision": -0.3}
 
 
 @dataclass(frozen=True)
 class MACSimulatorConfig:
-    """MAC 仿真器的配置集合。"""
+    """Configuration object describing the linear MAC simulator."""
 
     regions: Tuple[RegionTrafficProfile, ...]
-    history_size: int = HISTORY_DIM
-    protocol_count: int = MAC_PROTOCOL_COUNT
-    preamble_subset_count: int = PREAMBLE_SUBSET_COUNT
+    segments: Tuple[RegionSegment, ...]
     total_preambles: int = DEFAULT_TOTAL_PREAMBLES
     base_preamble_split: Tuple[int, int, int] = (24, 24, 16)
-    reward_weights: Mapping[str, float] = field(
-        default_factory=lambda: {
-            "throughput": 1.0,
-            "collision": -0.5,
-            # 当 CFRA 与理论可移交数量不匹配时的均方误差惩罚（通常为负值以降低奖励）
-            "cfra_mse": -1,
-        }
-    )
-    region_transition_matrix: Optional[Tuple[Tuple[float, ...], ...]] = None
-    coverage_patches: Optional[Tuple[CoveragePatch, ...]] = None
-    coverage_drift_radius: float = 1.0
-    coverage_cycle_slots: float = 1440.0
-    coverage_jitter: float = 0.05
-    coverage_smoothing: float = 0.2
-    coverage_total_footprint: float = 1.0
-    backoff_strategy: BackoffStrategyConfig = field(default_factory=BackoffStrategyConfig)
+    history_size: int = DEFAULT_HISTORY_SIZE
+    coverage_window: float = 3.0
+    motion_per_step: float = 0.1
+    slots_per_motion: int = 10
+    noise_scale: float = 0.05
+    reward_weights: Dict[str, float] = field(default_factory=_default_reward_weights)
+    backoff_strategy: BackoffStrategyConfig = field(default_factory=_default_backoff_strategy)
 
     def __post_init__(self) -> None:
-        total = sum(self.base_preamble_split)
-        if total != self.total_preambles:
+        if not self.regions:
+            raise ValueError("At least one region profile is required")
+        if not self.segments:
+            raise ValueError("At least one linear segment is required")
+        valid_names = {region.name for region in self.regions}
+        for segment in self.segments:
+            if segment.region_name not in valid_names:
+                raise ValueError(f"Unknown region reference '{segment.region_name}' in segments")
+        if self.total_preambles <= 0:
+            raise ValueError("total_preambles must be positive")
+        if len(self.base_preamble_split) != 3:
+            raise ValueError("base_preamble_split must contain CBRA/PBRA/CFRA counts")
+        if sum(self.base_preamble_split) != self.total_preambles:
+            raise ValueError("base_preamble_split must sum to total_preambles")
+        if self.history_size != DEFAULT_HISTORY_SIZE:
             raise ValueError(
-                "base_preamble_split 各部分之和必须等于 total_preambles"
+                "For the current environment binding history_size must equal DEFAULT_HISTORY_SIZE"
             )
-        if self.region_transition_matrix is not None:
-            matrix = self.region_transition_matrix
-            row_count = len(matrix)
-            if row_count != len(self.regions):
-                raise ValueError("region_transition_matrix 行数应与 regions 数量一致")
-            for row in matrix:
-                if len(row) != len(self.regions):
-                    raise ValueError("region_transition_matrix 应为方阵")
-                if any(value < 0 for value in row):
-                    raise ValueError("region_transition_matrix 中的元素需为非负数")
-                if sum(row) <= 0:
-                    raise ValueError("region_transition_matrix 的行和需为正值")
-        if self.coverage_cycle_slots <= 0:
-            raise ValueError("coverage_cycle_slots 应为正数")
-        if self.coverage_drift_radius < 0:
-            raise ValueError("coverage_drift_radius 应为非负数")
-        if self.coverage_jitter < 0:
-            raise ValueError("coverage_jitter 应为非负数")
-        if not 0.0 <= self.coverage_smoothing < 1.0:
-            raise ValueError("coverage_smoothing 应位于 [0, 1) 区间")
-        if self.coverage_total_footprint <= 0:
-            raise ValueError("coverage_total_footprint 应为正数")
-        if self.coverage_patches is not None:
-            for patch in self.coverage_patches:
-                if len(patch.region_weights) != len(self.regions):
-                    raise ValueError("coverage_patch.region_weights 长度需与 regions 数量一致")
-                if patch.radius <= 0:
-                    raise ValueError("coverage_patch.radius 应为正数")
-                if patch.strength < 0:
-                    raise ValueError("coverage_patch.strength 应为非负数")
-        strategy = self.backoff_strategy
-        if strategy.max_backlog_steps < 1:
-            raise ValueError("max_backlog_steps 应为正整数")
-        for window in (strategy.low, strategy.medium, strategy.high):
-            if window.min_steps < 0 or window.max_steps < window.min_steps:
-                raise ValueError("BackoffWindow 的范围定义不合法")
-            if window.max_steps > strategy.max_backlog_steps:
-                raise ValueError("BackoffWindow 上界需不超过 max_backlog_steps")
-        if not 0.0 <= strategy.collision_threshold_medium <= 1.0:
-            raise ValueError("collision_threshold_medium 应位于 [0, 1]")
-        if not 0.0 <= strategy.collision_threshold_high <= 1.0:
-            raise ValueError("collision_threshold_high 应位于 [0, 1]")
-        if strategy.collision_threshold_high < strategy.collision_threshold_medium:
-            raise ValueError("高拥塞阈值应不小于中等拥塞阈值")
+        if self.history_size * len(_STAT_KEYS) != HISTORY_DIM:
+            raise ValueError("history_size does not match HISTORY_DIM expectations")
+        if self.slots_per_motion <= 0:
+            raise ValueError("slots_per_motion must be positive")
+        if self.coverage_window <= 0.0:
+            raise ValueError("coverage_window must be positive")
+        if self.motion_per_step <= 0.0:
+            raise ValueError("motion_per_step must be positive")
+        if self.noise_scale < 0.0:
+            raise ValueError("noise_scale cannot be negative")
+        if not {"throughput", "collision"}.issubset(self.reward_weights):
+            raise ValueError("reward_weights must define throughput and collision keys")
+
+
+# --- Core simulator implementation -------------------------------------------------
 
 
 class MACSimulator:
-    """提供初始化状态与接入仿真的占位实现。
+    """Linear MAC simulator with moving coverage window and regional densities."""
 
-    该类暴露 ``initialize_state`` 与 ``run_slots`` 两个核心方法，供
-    gymnasium 环境直接调用。未来可在此类内部替换为高保真的物理与流量模型。
-    """
-
-    def __init__(self, config: MACSimulatorConfig, rng: Optional[np.random.Generator] = None) -> None:
+    def __init__(self, config: MACSimulatorConfig, *, rng: Optional[np.random.Generator] = None) -> None:
         self.config = config
         self._rng = rng or np.random.default_rng()
-        self._time_slot = 0
-        self._history = np.zeros((self.config.history_size,), dtype=np.float32)
-        self._base_preambles = np.asarray(self.config.base_preamble_split, dtype=np.float32)
-        self._initial_preambles = self._base_preambles.copy()
-        self._current_preambles = self._base_preambles.copy()
-
-        self._regions = self.config.regions
-        self._region_count = len(self._regions)
-        if self._region_count == 0:
-            raise ValueError("至少应配置一个区域画像")
-
-        self._cox_configs = [
-            CoxProcessConfig(
-                intensity_mean=profile.cox_intensity_mean,
-                intensity_variance=profile.cox_intensity_variance,
-                grid_shape=profile.cox_grid,
-                region_bounds=profile.region_bounds,
-            )
-            for profile in self._regions
-        ]
-        self._cox_cell_counts = np.array(
-            [cfg.grid_shape[0] * cfg.grid_shape[1] for cfg in self._cox_configs],
-            dtype=np.float32,
-        )
-        self._batch_mean = np.array(
-            [profile.batch_mean for profile in self._regions],
-            dtype=np.float32,
-        )
-        self._batch_std = np.array(
-            [profile.batch_std for profile in self._regions],
-            dtype=np.float32,
-        )
-        self._residence_means = np.array(
-            [profile.residence_time_mean for profile in self._regions],
-            dtype=np.float32,
-        )
-
-        region_weights = np.array([profile.area_weight for profile in self._regions], dtype=np.float64)
-        weight_sum = region_weights.sum()
-        if weight_sum <= 0:
-            raise ValueError("region area_weight 应为正值")
-        self._region_prob = region_weights / weight_sum
-
-        self._coverage_patches = tuple(self.config.coverage_patches or ())
-        if self._coverage_patches:
-            self._coverage_reference = float(
-                max(sum(patch.strength for patch in self._coverage_patches), 1.0)
-            )
-        else:
-            self._coverage_reference = float(self._region_count)
-
-        if self.config.region_transition_matrix is not None:
-            matrix = np.asarray(self.config.region_transition_matrix, dtype=np.float64)
-            row_sums = matrix.sum(axis=1, keepdims=True)
-            self._transition_matrix = np.divide(
-                matrix,
-                row_sums,
-                out=np.zeros_like(matrix),
-                where=row_sums != 0,
-            )
-            row_totals = self._transition_matrix.sum(axis=1)
-            for idx, total in enumerate(row_totals):
-                if total <= 0.0:
-                    self._transition_matrix[idx] = self._region_prob
-        else:
-            if self._region_count == 1:
-                self._transition_matrix = np.ones((1, 1), dtype=np.float64)
-            else:
-                stay_prob = 0.6
-                off_diag = (1.0 - stay_prob) / (self._region_count - 1)
-                matrix = np.full((self._region_count, self._region_count), off_diag, dtype=np.float64)
-                np.fill_diagonal(matrix, stay_prob)
-                self._transition_matrix = matrix
-
-        self._current_region_idx: Optional[int] = None
-        self._coverage_phase = float(self._rng.random())
-        self._footprint_center = np.zeros(2, dtype=np.float32)
-        self._region_mixture_state = self._region_prob.astype(np.float32)
-        self._backoff_strategy = self.config.backoff_strategy
-        backlog_len = self._backoff_strategy.max_backlog_steps + 1
-        self._backoff_queue_cbra = np.zeros(backlog_len, dtype=np.float32)
-        self._backoff_queue_pbra = np.zeros(backlog_len, dtype=np.float32)
+        self._region_index = {region.name: idx for idx, region in enumerate(config.regions)}
+        self._region_profiles = {region.name: region for region in config.regions}
+        self._segments: List[Tuple[float, float, RegionSegment]] = []
+        cursor = 0.0
+        for segment in config.segments:
+            start = cursor
+            end = cursor + segment.length
+            self._segments.append((start, end, segment))
+            cursor = end
+        self._track_length = cursor
+        if self._track_length <= 0.0:
+            raise ValueError("Total track length must be positive")
+        self._motion_per_slot = config.motion_per_step / config.slots_per_motion
+        self._history_buffer = np.zeros((config.history_size, len(_STAT_KEYS)), dtype=np.float32)
+        self._history_index = 0
+        self._preamble_allocation = np.array(config.base_preamble_split, dtype=np.int32)
+        self._preamble_usage = np.zeros((PREAMBLE_SUBSET_COUNT,), dtype=np.float32)
+        max_queue = config.backoff_strategy.max_backlog_steps + 1
+        self._backoff_queue_cbra = np.zeros((max_queue,), dtype=np.float32)
+        self._backoff_queue_pbra = np.zeros((max_queue,), dtype=np.float32)
+        self._current_acb = 1.0
+        self._request_scale = 10000
+        self._backoff_scale = 100000
+        self._active_terminals = np.zeros((MAC_PROTOCOL_COUNT,), dtype=np.float32)
+        self._success_total = 0.0
+        self._collision_total = 0.0
+        self._success_breakdown = np.zeros((MAC_PROTOCOL_COUNT,), dtype=np.float32)
+        self._collision_breakdown = np.zeros((MAC_PROTOCOL_COUNT,), dtype=np.float32)
+        self._last_requests_cbra = 0.0
+        self._last_requests_pbra = 0.0
         self._last_collision_ratio_cbra = 0.0
         self._last_collision_ratio_pbra = 0.0
+        self._reset_coverage_position()
+
+    # -- Public control surface -----------------------------------------------------
 
     def reseed(self, seed: Optional[int]) -> None:
-        """重置随机数生成器。"""
-
-        if seed is not None:
-            self._rng = np.random.default_rng(seed)
-
-    def compute_combo_mask(self, delta_pairs: Sequence[Tuple[int, int]]) -> np.ndarray:
-        """基于当前前导分配计算合法的 (ΔCBRA, ΔPBRA) 组合 mask。"""
-
-        total = float(self.config.total_preambles)
-        current_cbra = float(self._current_preambles[0])
-        current_pbra = float(self._current_preambles[1])
-        mask = np.zeros(len(delta_pairs), dtype=np.float32)
-
-        for idx, (delta_cbra, delta_pbra) in enumerate(delta_pairs):
-            next_cbra = current_cbra + float(delta_cbra)
-            next_pbra = current_pbra + float(delta_pbra)
-            if next_cbra < 0.0 or next_pbra < 0.0:
-                continue
-            if next_cbra + next_pbra > total:
-                continue
-            mask[idx] = 1.0
-
-        if not np.any(mask):
-            try:
-                zero_idx = delta_pairs.index((0, 0))  # type: ignore[arg-type]
-            except ValueError:
-                zero_idx = 0
-            mask[zero_idx] = 1.0
-        return mask
+        if seed is None:
+            return
+        self._rng = np.random.default_rng(seed)
 
     def reset_access_allocation(self) -> None:
-        """重置接入资源分配到初始状态。"""
-
-        self._initial_preambles = self._base_preambles.copy()
-        self._current_preambles = self._base_preambles.copy()
-
-    def initialize_state(self, seed: Optional[int] = None) -> Dict[str, np.ndarray]:
-        """生成初始观测状态。
-
-        Args:
-            seed: 可选的随机种子，用于复现。
-
-        Returns:
-            与环境观测空间匹配的张量字典。
-        """
-
-        self.reseed(seed)
-        self._time_slot = 0
-        self._history.fill(0.0)
-        self._current_preambles = self._initial_preambles.copy()
-        self._current_region_idx = int(self._rng.choice(self._region_count, p=self._region_prob))
-        self._coverage_phase = float(self._rng.random())
-        self._footprint_center.fill(0.0)
-        self._region_mixture_state = self._region_prob.astype(np.float32)
-        self._backoff_queue_cbra.fill(0.0)
-        self._backoff_queue_pbra.fill(0.0)
-        self._last_collision_ratio_cbra = 0.0
-        self._last_collision_ratio_pbra = 0.0
-        return self._sample_observation(region_mixture=self._region_mixture_state)
+        self._preamble_allocation = np.array(self.config.base_preamble_split, dtype=np.int32)
+        self._update_preamble_usage(reset=True)
 
     def configure_access_state(
         self,
@@ -338,644 +207,563 @@ class MACSimulator:
         pbra: Optional[int] = None,
         cfra: Optional[int] = None,
     ) -> None:
-        """强制设置初始 RA 资源。"""
-
-        total = float(self.config.total_preambles)
-        current = self._initial_preambles.copy().astype(np.float64)
-
+        total = self.config.total_preambles
+        current = self._preamble_allocation.astype(int)
         if cbra is not None:
-            current[0] = float(cbra)
+            current[0] = int(cbra)
         if pbra is not None:
-            current[1] = float(pbra)
+            current[1] = int(pbra)
         if cfra is not None:
-            current[2] = float(cfra)
-        else:
-            current[2] = total - current[0] - current[1]
+            current[2] = int(cfra)
+        if np.any(current < 0):
+            raise ValueError("Preamble allocation cannot be negative")
+        if int(np.sum(current)) != total:
+            raise ValueError("Allocation must sum to total preambles")
+        self._preamble_allocation = np.array(current).astype(int)
+        # self._project_preamble_allocation(current)
+        self._update_preamble_usage(reset=True)
 
-        current = np.clip(current, 0.0, None)
-        total_sum = current.sum()
-        if total_sum <= 0:
-            raise ValueError("RA 资源总量必须为正数")
-
-        if not np.isclose(total_sum, total):
-            current = current / total_sum * total
-
-        self._initial_preambles = current.astype(np.float32)
-        self._current_preambles = self._initial_preambles.copy()
-        self._base_preambles = self._initial_preambles.copy()
+    def initialize_state(self, seed: Optional[int] = None) -> Dict[str, np.ndarray]:
+        if seed is not None:
+            self.reseed(seed)
+        self._history_buffer.fill(0.0)
+        self._history_index = 0
+        self._backoff_queue_cbra.fill(0.0)
+        self._backoff_queue_pbra.fill(0.0)
+        self._success_total = 0.0
+        self._collision_total = 0.0
+        self._success_breakdown.fill(0.0)
+        self._collision_breakdown.fill(0.0)
+        self._slot_counter = 0
+        self._current_acb = 1.0
+        self._reset_coverage_position()
+        self._active_terminals.fill(0.0)
+        self._last_requests_cbra = 0.0
+        self._last_requests_pbra = 0.0
+        self._last_collision_ratio_cbra = 0.0
+        self._last_collision_ratio_pbra = 0.0
+        self.reset_access_allocation()
+        return self._build_observation()
 
     def run_slots(
         self,
+        *,
         num_slots: int,
-        params: Mapping[str, float],
+        params: Dict[str, float],
     ) -> Tuple[float, Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-        """执行给定数量的接入时隙仿真。
-
-        Args:
-            num_slots: 本次仿真包含的接入时隙数量。
-            params: 来自强化学习动作的 MAC 参数调整。
-
-        Returns:
-            reward: 标量奖励。
-            next_state: 下一时刻的观测字典。
-            info: 额外诊断信息的字典。
-        """
-
         if num_slots <= 0:
-            raise ValueError("num_slots 应为正整数")
+            raise ValueError("num_slots must be positive")
+        arrival_cbra, arrival_pbra, arrival_cfra = self._forecast_arrivals(num_slots)
+        delta_cbra = int(params.get("M_CBRA", 0))
+        delta_pbra = int(params.get("M_PBRA", 0))
+        self._current_acb = float(np.clip(params.get("q_ACB", 1.0), 0.0, 1.0))
+        self._apply_preamble_delta(delta_cbra, delta_pbra)
+        assert (
+            int(np.sum(self._preamble_allocation)) == int(self.config.total_preambles)
+        ), "Invalid preamble allocation after applying deltas"
+        total_success_cbra = 0.0
+        total_success_pbra = 0.0
+        total_collision_cbra = 0.0
+        total_collision_pbra = 0.0
+        total_admitted_cbra = 0.0
+        total_admitted_pbra = 0.0
+        total_cfra_attempts = 0.0
+        total_cbra_pool = 0.0
+        total_pbra_pool = 0.0
 
-        # 解码动作与调整资源
-        cbra_adj = float(params.get("M_CBRA", 0.0))
-        pbra_adj = float(params.get("M_PBRA", 0.0))
-        acb_factor = float(np.clip(params.get("q_ACB", 0.5), 0.0, 1.0))
-
-        cbra_count, pbra_count, cfra_count = self._apply_preamble_adjustment(
-            cbra_adj=cbra_adj,
-            pbra_adj=pbra_adj,
-        )
-        # 覆盖混合更新与重试释放
-        mixture = self._update_region_mixture(num_slots)
-        release_steps = 1 if num_slots > 0 else 0
-        cbra_retries = (
-            self._pop_backoff_queue(self._backoff_queue_cbra, release_steps)
-            if np.any(self._backoff_queue_cbra)
-            else 0.0
-        )
-        pbra_retries = (
-            self._pop_backoff_queue(self._backoff_queue_pbra, release_steps)
-            if np.any(self._backoff_queue_pbra)
-            else 0.0
-        )
-
-        footprint_scale = float(self.config.coverage_total_footprint)
-        slot_count = max(int(num_slots), 1)
-        per_slot_region_requests_cbra = np.zeros((slot_count, self._region_count), dtype=np.float64)
-        per_slot_region_requests_pbra = np.zeros((slot_count, self._region_count), dtype=np.float64)
-        per_region_requests_cfra = np.zeros(self._region_count, dtype=np.float64)
-
-        # 使用确定性期望值替代原始随机批次泊松抽样：
-        # demand = base_density * region_scale * density_factor * num_slots * batch_mean * residence_scale
-        for idx, weight in enumerate(mixture):
-            if weight <= 0.0:
-                continue
-            region = self._regions[idx]
-            density_factor, dwell_time = self._sample_region_factors(idx)
-            region_scale = max(weight * footprint_scale, 0.0)
-
-            # 基于期望到达率而非随机抽样
-            base_cbra = max(region.cbra_density * region_scale, 0.0)
-            base_pbra = max(region.pbra_density * region_scale, 0.0)
-
-            # 利用区域设定的 batch_mean 作为平均批次规模，得到“单个 slot”的期望到达数
-            residence_scale = max(dwell_time / max(self._residence_means[idx], 1e-10), 0.1)
-            expected_cbra_per_slot = float(
-                base_cbra * density_factor * float(self._batch_mean[idx]) * residence_scale
+        for slot_idx in range(num_slots):
+            metrics = self._simulate_slot(
+                cbra_new=int(arrival_cbra[slot_idx]),
+                pbra_new=int(arrival_pbra[slot_idx]),
+                cfra_demand=int(arrival_cfra[slot_idx]),
             )
-            print(expected_cbra_per_slot, mixture)
-            expected_pbra_per_slot = float(
-                base_pbra * density_factor * float(self._batch_mean[idx]) * residence_scale
-            )
+            total_success_cbra += float(metrics["success_cbra"])
+            total_success_pbra += float(metrics["success_pbra"])
+            total_collision_cbra += float(metrics["collision_cbra"])
+            total_collision_pbra += float(metrics["collision_pbra"])
+            total_admitted_cbra += float(metrics["requests_cbra"])
+            total_admitted_pbra += float(metrics["requests_pbra"])
+            total_cfra_attempts += float(metrics["cfra_attempts"])
+            total_cbra_pool += float(metrics["total_cbra_pool"])
+            total_pbra_pool += float(metrics["total_pbra_pool"])
 
-            # handover 期望值（使用平均批次大小近似）
-            expected_handover = float(
-                region.handover_intensity
-                * region_scale
-                * density_factor
-                * max(num_slots, 1)
-                * float(self._batch_mean[idx])
-            )
+        available_cfra = int(num_slots * int(self._preamble_allocation[2]))
+        success_cfra = min(total_cfra_attempts, available_cfra)
+        collision_cfra = max(total_cfra_attempts - success_cfra, 0.0)
 
-            per_slot_region_requests_cbra[:, idx] = expected_cbra_per_slot
-            per_slot_region_requests_pbra[:, idx] = expected_pbra_per_slot
-            per_region_requests_cfra[idx] = expected_handover
-        # 将等待释放的重试按混合权重分配到区域（期望值基础）
-        if cbra_retries > 0.0:
-            retry_per_slot = float(cbra_retries) / slot_count
-            per_slot_region_requests_cbra += retry_per_slot * mixture
-        if pbra_retries > 0.0:
-            retry_per_slot = float(pbra_retries) / slot_count
-            per_slot_region_requests_pbra += retry_per_slot * mixture
-
-        per_region_requests_cbra = per_slot_region_requests_cbra.sum(axis=0)
-        per_region_requests_pbra = per_slot_region_requests_pbra.sum(axis=0)
-
-        slot_requests_cbra = per_slot_region_requests_cbra.sum(axis=1)
-        slot_requests_pbra = per_slot_region_requests_pbra.sum(axis=1)
-
-        cbra_requests = float(np.sum(slot_requests_cbra))
-        pbra_requests = float(np.sum(slot_requests_pbra))
-        handover_requests = float(np.sum(per_region_requests_cfra))
-        # ACB（接入控制）在此以确定性接受率应用：被允许进入的尝试数 = arrivals * acb_factor
-        accepted_slot_cbra = slot_requests_cbra * acb_factor
-        accepted_slot_pbra = slot_requests_pbra * acb_factor
-
-        accepted_cbra = float(np.sum(accepted_slot_cbra))
-        accepted_pbra = float(np.sum(accepted_slot_pbra))
-
-        # 包括因退避释放的重试（已经加回到 per_region_requests_* 中），上面已计入
-
-        # 资源竞争：引入“缓冲”逻辑，每个 slot 单独计算碰撞
-        eps = 1e-6
-        success_cbra, collision_cbra = self._apply_slot_buffer(
-            slot_requests=accepted_slot_cbra,
-            capacity=float(cbra_count),
-            queue=self._backoff_queue_cbra,
+        throughput_total = total_success_cbra + total_success_pbra + success_cfra
+        collision_total = total_collision_cbra + total_collision_pbra + collision_cfra
+        total_demand = max(
+            1e-10,
+            total_admitted_cbra + total_admitted_pbra + total_cfra_attempts,
         )
-        success_pbra, collision_pbra = self._apply_slot_buffer(
-            slot_requests=accepted_slot_pbra,
-            capacity=float(pbra_count),
-            queue=self._backoff_queue_pbra,
+        reward_total = throughput_total / total_demand
+        # (
+        #      * self.config.reward_weights["throughput"]
+        #     # + collision_total * self.config.reward_weights["collision"]
+        # ) / total_demand
+        # reward_total = reward_avg * float(num_slots)
+
+        avg_requests_cbra = total_admitted_cbra / float(num_slots)
+        avg_requests_pbra = total_admitted_pbra / float(num_slots)
+        ratio_cbra = (
+            total_collision_cbra / total_admitted_cbra if total_admitted_cbra > 0.0 else 0.0
+        )
+        ratio_pbra = (
+            total_collision_pbra / total_admitted_pbra if total_admitted_pbra > 0.0 else 0.0
         )
 
-        actual_transfer = min(handover_requests, float(cfra_count) * num_slots)
-        handover_success = float(actual_transfer)
-        handover_blocked = max(handover_requests - handover_success, 0.0)
-
-        success_total = success_cbra + success_pbra + handover_success * 5
-        collision_total = collision_cbra + collision_pbra
-
-        eps = 1e-6
-        share_cbra = per_region_requests_cbra / max(cbra_requests, eps)
-        share_pbra = per_region_requests_pbra / max(pbra_requests, eps)
-        share_cfra = per_region_requests_cfra / max(handover_requests, eps)
-
-        per_region_success_cbra = success_cbra * share_cbra
-        per_region_success_pbra = success_pbra * share_pbra
-        per_region_success_cfra = handover_success * share_cfra
-        per_region_collision_cbra = collision_cbra * share_cbra
-        per_region_collision_pbra = collision_pbra * share_pbra
-
-        reward = (
-            self.config.reward_weights.get("throughput", 0.0) * success_total
-            + self.config.reward_weights.get("collision", 0.0) * collision_total
+        self._success_total += throughput_total
+        self._collision_total += collision_total
+        self._success_breakdown += np.array(
+            [total_success_cbra, total_success_pbra, success_cfra], dtype=np.float32
+        )
+        self._collision_breakdown += np.array(
+            [total_collision_cbra, total_collision_pbra, collision_cfra], dtype=np.float32
         )
 
-        # CFRA 匹配惩罚（相对误差的 MSE）——当 handover_requests 为 0 时不计入惩罚
-        if handover_requests > eps:
-            ratio = (float(cfra_count) * num_slots) / (handover_requests + eps)
-            cfra_mse = float((ratio - 1.0) ** 2)
+        self._last_requests_cbra = float(avg_requests_cbra)
+        self._last_requests_pbra = float(avg_requests_pbra)
+        self._last_collision_ratio_cbra = float(ratio_cbra)
+        self._last_collision_ratio_pbra = float(ratio_pbra)
+
+        preamble_cbra_capacity = max(float(num_slots * int(self._preamble_allocation[0])), 1.0)
+        preamble_pbra_capacity = max(float(num_slots * int(self._preamble_allocation[1])), 1.0)
+        preamble_cfra_capacity = max(float(num_slots * int(self._preamble_allocation[2])), 1.0)
+        self._update_preamble_usage(
+            cbra_util=total_success_cbra / preamble_cbra_capacity,
+            pbra_util=total_success_pbra / preamble_pbra_capacity,
+            cfra_util=success_cfra / preamble_cfra_capacity,
+        )
+
+        self._active_terminals = np.array(
+            [total_cbra_pool, total_pbra_pool, total_cfra_attempts], dtype=np.float32
+        )
+        total_terminals = float(np.sum(self._active_terminals))
+        if total_terminals > 0.0:
+            self._active_terminals /= total_terminals
         else:
-            cfra_mse = 0.0
-        reward += float(self.config.reward_weights.get("cfra_mse", 0.0)) * cfra_mse
+            self._active_terminals.fill(0.0)
 
-        # 碰撞率按已接受的尝试比例计算（接受但失败的比例）
-        collision_ratio_cbra = float(collision_cbra / max(accepted_cbra, eps))
-        collision_ratio_pbra = float(collision_pbra / max(accepted_pbra, eps))
-
-        window_cbra = self._select_backoff_window(collision_ratio_cbra)
-        window_pbra = self._select_backoff_window(collision_ratio_pbra)
-
-        self._last_collision_ratio_cbra = float(collision_ratio_cbra)
-        self._last_collision_ratio_pbra = float(collision_ratio_pbra)
-
-        next_state = self._sample_observation(
-            cbra_requests=cbra_requests,
-            pbra_requests=pbra_requests,
-            collision_ratio_cbra=collision_ratio_cbra,
-            collision_ratio_pbra=collision_ratio_pbra,
-            acb_factor=acb_factor,
-            preamble_allocation=self._current_preamble_ratio(),
-            success_total=success_total,
-            collision_total=collision_total,
-            region_mixture=mixture,
-            coverage_center=self._footprint_center,
-            coverage_phase=self._coverage_phase,
-            pending_backoff_cbra=self._backoff_queue_cbra.sum(),
-            pending_backoff_pbra=self._backoff_queue_pbra.sum(),
+        self._update_history(
+            np.array(
+                [
+                    self._last_requests_cbra / self._request_scale,
+                    self._last_requests_pbra / self._request_scale,
+                    self._last_collision_ratio_cbra,
+                    self._last_collision_ratio_pbra,
+                    float(np.sum(self._backoff_queue_cbra)) / self._backoff_scale,
+                    float(np.sum(self._backoff_queue_pbra)) / self._backoff_scale,
+                ],
+                dtype=np.float32,
+            )
         )
 
-        dominant_idx = int(np.argmax(mixture)) if mixture.size else 0
-        self._current_region_idx = dominant_idx
-        dominant_region_name = self._regions[dominant_idx].name
+        aggregates = {
+            "throughput": throughput_total,
+            "success_cbra": total_success_cbra,
+            "success_pbra": total_success_pbra,
+            "success_cfra": success_cfra,
+            "collision_cbra": total_collision_cbra,
+            "collision_pbra": total_collision_pbra,
+            "collision_cfra": collision_cfra,
+        }
+        observation = self._build_observation()
+        info = self._build_info(aggregates)
+        return reward_total, observation, info
 
-        info = {
-            "region": dominant_region_name,
-            "dominant_region": dominant_region_name,
-            "region_index": np.array([dominant_idx], dtype=np.float32),
-            "region_mixture": mixture.astype(np.float32),
-            "coverage_center": self._footprint_center.astype(np.float32),
-            "coverage_phase": np.array([self._coverage_phase], dtype=np.float32),
-            "requests_cbra": np.array([cbra_requests], dtype=np.float32),
-            "requests_pbra": np.array([pbra_requests], dtype=np.float32),
-            "requests_cfra": np.array([handover_requests], dtype=np.float32),
-            "region_requests_cbra": per_region_requests_cbra.astype(np.float32),
-            "region_requests_pbra": per_region_requests_pbra.astype(np.float32),
-            "region_requests_cfra": per_region_requests_cfra.astype(np.float32),
-            "success_cbra": np.array([success_cbra], dtype=np.float32),
-            "success_pbra": np.array([success_pbra], dtype=np.float32),
-            "success_cfra": np.array([handover_success], dtype=np.float32),
-            "collision_cbra": np.array([collision_cbra], dtype=np.float32),
-            "collision_pbra": np.array([collision_pbra], dtype=np.float32),
-            "collision_cfra": np.array([handover_blocked], dtype=np.float32),
-            "region_success_cbra": per_region_success_cbra.astype(np.float32),
-            "region_success_pbra": per_region_success_pbra.astype(np.float32),
-            "region_success_cfra": per_region_success_cfra.astype(np.float32),
-            "region_collision_cbra": per_region_collision_cbra.astype(np.float32),
-            "region_collision_pbra": per_region_collision_pbra.astype(np.float32),
-            "preamble_allocation": self._current_preamble_ratio().astype(np.float32),
-            "success_total": np.array([success_total], dtype=np.float32),
-            "collision_total": np.array([collision_total], dtype=np.float32),
-            "throughput": np.array([success_total], dtype=np.float32),
-            "slots_simulated": np.array([num_slots], dtype=np.float32),
-            "pending_backoff_cbra": np.array([self._backoff_queue_cbra.sum()], dtype=np.float32),
-            "pending_backoff_pbra": np.array([self._backoff_queue_pbra.sum()], dtype=np.float32),
-            "backoff_window_cbra": np.array([window_cbra.min_steps, window_cbra.max_steps], dtype=np.float32),
-            "backoff_window_pbra": np.array([window_pbra.min_steps, window_pbra.max_steps], dtype=np.float32),
-            "retries_released_cbra": np.array([cbra_retries], dtype=np.float32),
-            "retries_released_pbra": np.array([pbra_retries], dtype=np.float32),
-            "acb_factor": acb_factor,
+    def _snapshot_motion_state(self) -> Tuple[int, float, float, List[Tuple[float, float]], np.ndarray]:
+        prev_components_copy = [tuple(component) for component in self._prev_components]
+        region_mixture_copy = getattr(self, "_region_mixture", np.zeros((len(self.config.regions),), dtype=np.float32)).copy()
+        return (
+            self._slot_counter,
+            self._coverage_center,
+            self._coverage_phase,
+            prev_components_copy,
+            region_mixture_copy,
+        )
+
+    def _restore_motion_state(
+        self,
+        snapshot: Tuple[int, float, float, List[Tuple[float, float]], np.ndarray],
+    ) -> None:
+        slot_counter, coverage_center, coverage_phase, prev_components, region_mixture = snapshot
+        self._slot_counter = slot_counter
+        self._coverage_center = coverage_center
+        self._coverage_phase = coverage_phase
+        self._prev_components = prev_components
+        self._region_mixture = region_mixture
+
+    def _forecast_arrivals(self, num_slots: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if num_slots <= 0:
+            empty = np.zeros((0,), dtype=np.int32)
+            return empty, empty, empty
+        snapshot = self._snapshot_motion_state()
+        cbra_arrivals = np.zeros((num_slots,), dtype=np.int32)
+        pbra_arrivals = np.zeros((num_slots,), dtype=np.int32)
+        cfra_arrivals = np.zeros((num_slots,), dtype=np.int32)
+
+        for slot_idx in range(num_slots):
+            components = self._current_interval_components()
+            region_lengths = np.zeros((len(self.config.regions),), dtype=np.float32)
+            cbra_demand = 0.0
+            pbra_demand = 0.0
+            cfra_density_weighted = 0.0
+            for comp_start, comp_end in components:
+                for seg_start, seg_end, segment in self._segments:
+                    overlap = _interval_overlap(comp_start, comp_end, seg_start, seg_end)
+                    if overlap <= 0.0:
+                        continue
+                    profile = self._region_profiles[segment.region_name]
+                    noise = 1.0 + self._rng.uniform(-self.config.noise_scale, self.config.noise_scale)
+                    cbra_demand += overlap * profile.cbra_density * noise
+                    pbra_demand += overlap * profile.pbra_density * noise
+                    cfra_density_weighted += overlap * profile.cfra_density
+                    region_idx = self._region_index[profile.name]
+                    region_lengths[region_idx] += overlap
+            total_length = float(np.sum(region_lengths))
+            if total_length > 0.0:
+                average_cfra_density = cfra_density_weighted / total_length
+            else:
+                average_cfra_density = 0.0
+            cbra_arrivals[slot_idx] = int(max(0, math.ceil(cbra_demand)))
+            pbra_arrivals[slot_idx] = int(max(0, math.ceil(pbra_demand)))
+            new_length = self._new_coverage_length(components)
+            cfra_arrivals[slot_idx] = int(max(0, math.ceil(new_length * average_cfra_density)))
+            self._prev_components = components
+            self._advance_coverage()
+
+        self._restore_motion_state(snapshot)
+        return cbra_arrivals, pbra_arrivals, cfra_arrivals
+
+    def compute_combo_mask(self, delta_pairs: Sequence[Tuple[int, int]]) -> np.ndarray:
+        mask = np.zeros((len(delta_pairs),), dtype=np.float32)
+        base_allocation = self._preamble_allocation.astype(int)
+        for idx, (delta_cbra, delta_pbra) in enumerate(delta_pairs):
+            trial = base_allocation.copy()
+            trial[0] += int(delta_cbra)
+            trial[1] += int(delta_pbra)
+            projected = self._project_preamble_allocation(trial)
+            if np.min(projected) < 1:
+                continue
+            if int(np.sum(projected)) != self.config.total_preambles:
+                continue
+            mask[idx] = 1.0
+        return mask
+
+    # -- Internal helpers -----------------------------------------------------------
+
+
+    def _apply_preamble_delta(self, delta_cbra: int, delta_pbra: int) -> None:
+        if delta_cbra == 0 and delta_pbra == 0:
+            return
+        allocation = self._preamble_allocation.astype(int)
+        allocation[0] += int(delta_cbra)
+        allocation[1] += int(delta_pbra)
+        self._preamble_allocation = self._project_preamble_allocation(allocation)
+
+    def count_success_and_fail(self, admitted: int, preamble: float) -> Tuple[int, int]:
+        if admitted <= 0:
+            return 0, 0
+        elif admitted <= preamble:
+            return admitted, 0
+        elif preamble < admitted < preamble * 2:
+            success = preamble * 2 - admitted
+            collision = admitted - success
+            return success, collision
+        else:
+            return 0, admitted
+
+    def _simulate_slot(self, *, cbra_new: int, pbra_new: int, cfra_demand: int) -> Dict[str, float]:
+        ready_cbra = self._pop_backoff_queue(self._backoff_queue_cbra, 1)
+        ready_pbra = self._pop_backoff_queue(self._backoff_queue_pbra, 1)
+
+        components = self._current_interval_components()
+        self._update_region_mixture(components)
+
+        ready_cbra_int = int(round(ready_cbra))
+        ready_pbra_int = int(round(ready_pbra))
+
+        allowed_cbra_new = min(int(round(self._current_acb * cbra_new)), int(cbra_new))
+        allowed_pbra_new = min(int(round(self._current_acb * pbra_new)), int(pbra_new))
+        blocked_cbra = max(int(cbra_new) - allowed_cbra_new, 0)
+        blocked_pbra = max(int(pbra_new) - allowed_pbra_new, 0)
+
+        if blocked_cbra > 0:
+            self._schedule_backoff(
+                self._backoff_queue_cbra,
+                float(blocked_cbra),
+                self.config.backoff_strategy.low,
+            )
+        if blocked_pbra > 0:
+            self._schedule_backoff(
+                self._backoff_queue_pbra,
+                float(blocked_pbra),
+                self.config.backoff_strategy.low,
+            )
+
+        total_cbra_pool = allowed_cbra_new + ready_cbra_int
+        total_pbra_pool = allowed_pbra_new + ready_pbra_int
+
+        success_cbra, collision_cbra = self.count_success_and_fail(
+            total_cbra_pool, int(self._preamble_allocation[0])
+        )
+        success_pbra, collision_pbra = self.count_success_and_fail(
+            total_pbra_pool, int(self._preamble_allocation[1])
+        )
+
+        if collision_cbra > 0:
+            window_cbra = self._select_backoff_window(
+                collision_cbra / max(total_cbra_pool, 1)
+            )
+            self._schedule_backoff(self._backoff_queue_cbra, float(collision_cbra), window_cbra)
+        if collision_pbra > 0:
+            window_pbra = self._select_backoff_window(
+                collision_pbra / max(total_pbra_pool, 1)
+            )
+            self._schedule_backoff(self._backoff_queue_pbra, float(collision_pbra), window_pbra)
+
+        requests_cbra = success_cbra + collision_cbra
+        requests_pbra = success_pbra + collision_pbra
+
+        cfra_attempts = int(max(cfra_demand, 0))
+
+        self._prev_components = components
+        self._advance_coverage()
+
+        return {
+            "success_cbra": float(success_cbra),
+            "success_pbra": float(success_pbra),
+            "collision_cbra": float(collision_cbra),
+            "collision_pbra": float(collision_pbra),
+            "requests_cbra": float(requests_cbra),
+            "requests_pbra": float(requests_pbra),
+            "cfra_attempts": float(cfra_attempts),
+            "total_cbra_pool": float(cbra_new + ready_cbra_int),
+            "total_pbra_pool": float(pbra_new + ready_pbra_int),
         }
 
-        self._time_slot += num_slots
-        self._update_history(reward)
+    def _advance_coverage(self) -> None:
+        self._slot_counter += 1
+        self._coverage_center = (self._coverage_center + self._motion_per_slot) % self._track_length
+        self._coverage_phase = (self._coverage_center % self._track_length) / self._track_length
 
-        return float(reward), next_state, info
+    def _reset_coverage_position(self) -> None:
+        self._slot_counter = 0
+        self._coverage_center = self.config.coverage_window / 2.0
+        self._coverage_phase = (self._coverage_center % self._track_length) / self._track_length
+        components = self._current_interval_components()
+        self._prev_components = components
+        self._update_region_mixture(components)
 
-    def _sample_region_factors(self, region_idx: int) -> Tuple[float, float]:
-        """结合 Cox 过程与驻留时间采样区域流量因子。"""
+    def _current_interval_components(self) -> List[Tuple[float, float]]:
+        half = self.config.coverage_window / 2.0
+        start = (self._coverage_center - half) % self._track_length
+        end = start + self.config.coverage_window
+        if end <= self._track_length:
+            return [(start, end)]
+        return [(start, self._track_length), (0.0, end - self._track_length)]
 
-        cfg = self._cox_configs[region_idx]
-        points = generate_cox_points(cfg, self._rng)
-        cell_count = float(max(self._cox_cell_counts[region_idx], 1.0))
-        density_factor = max(len(points), 1.0) / cell_count
-        dwell_time = sample_residence_time(float(self._residence_means[region_idx]), self._rng)
-        return density_factor, dwell_time
-
-    def _draw_demand(
-        self,
-        base_density: float,
-        delta: float,
-        num_slots: int,
-        *,
-        region_idx: int,
-        density_factor: float,
-        dwell_time: float,
-    ) -> float:
-        """使用批量泊松与 Cox 过程生成随机到达需求。"""
-
-        seasonal = np.sin(2 * np.pi * (self._time_slot % 1440) / 1440.0)
-        baseline = max(base_density * (1.0 + delta), 0.0)
-        effective_rate = max(baseline * density_factor * (1.0 + 0.2 * seasonal), 1e-6)
-        poisson_cfg = BatchedPoissonConfig(
-            rate=effective_rate,
-            batch_mean=float(self._batch_mean[region_idx]),
-            batch_std=float(self._batch_std[region_idx]),
-        )
-        arrivals = batched_poisson_arrival(poisson_cfg, steps=max(num_slots, 1), rng=self._rng)
-        demand = float(np.sum(arrivals))
-        residence_scale = max(dwell_time / max(self._residence_means[region_idx], 1e-3), 0.1)
-        return max(demand * residence_scale, 0.0)
-
-    def _draw_handover(
-        self,
-        intensity: float,
-        num_slots: int,
-        *,
-        region_idx: int,
-        density_factor: float,
-    ) -> float:
-        """结合批量泊松过程模拟切换用户到达。"""
-
-        base_rate = max(intensity * density_factor, 1e-6)
-        poisson_cfg = BatchedPoissonConfig(
-            rate=base_rate,
-            batch_mean=float(self._batch_mean[region_idx]),
-            batch_std=float(self._batch_std[region_idx]),
-        )
-        arrivals = batched_poisson_arrival(poisson_cfg, steps=max(num_slots, 1), rng=self._rng)
-        return float(max(np.sum(arrivals), 0.0))
-
-    def _sample_observation(
-        self,
-        *,
-        cbra_requests: Optional[float] = None,
-        pbra_requests: Optional[float] = None,
-        collision_ratio_cbra: Optional[float] = None,
-        collision_ratio_pbra: Optional[float] = None,
-        acb_factor: Optional[float] = None,
-        preamble_allocation: Optional[np.ndarray] = None,
-        success_total: Optional[float] = None,
-        collision_total: Optional[float] = None,
-        region_mixture: Optional[np.ndarray] = None,
-        coverage_center: Optional[np.ndarray] = None,
-        coverage_phase: Optional[float] = None,
-        pending_backoff_cbra: Optional[float] = None,
-        pending_backoff_pbra: Optional[float] = None,
-    ) -> Dict[str, np.ndarray]:
-        """生成观测张量字典。"""
-
-        rng = self._rng
-        observation = {
-            "requests_cbra": np.array([cbra_requests if cbra_requests is not None else rng.gamma(2.0, 5.0)], dtype=np.float32),
-            "requests_pbra": np.array([pbra_requests if pbra_requests is not None else rng.gamma(2.0, 4.0)], dtype=np.float32),
-            "collision_ratio_cbra": np.array([
-                collision_ratio_cbra if collision_ratio_cbra is not None else rng.beta(2.0, 5.0)
-            ], dtype=np.float32),
-            "collision_ratio_pbra": np.array([
-                collision_ratio_pbra if collision_ratio_pbra is not None else rng.beta(2.0, 5.0)
-            ], dtype=np.float32),
-            "active_terminals_dist": rng.dirichlet(
-                alpha=np.ones(self.config.protocol_count, dtype=np.float64) + 0.1
-            ).astype(np.float32),
-            "preamble_usage": rng.dirichlet(
-                alpha=np.ones(self.config.preamble_subset_count, dtype=np.float64) + 0.1
-            ).astype(np.float32),
-            "current_ACB_factor": np.array([
-                acb_factor if acb_factor is not None else rng.uniform(0.2, 0.8)
-            ], dtype=np.float32),
-            "history_stats": self._history.astype(np.float32).copy(),
-            "preamble_allocation": (
-                preamble_allocation.astype(np.float32)
-                if preamble_allocation is not None
-                else self._current_preamble_ratio().astype(np.float32)
-            ),
-            "success_total": np.array([
-                success_total if success_total is not None else 0.0
-            ], dtype=np.float32),
-            "collision_total": np.array([
-                collision_total if collision_total is not None else 0.0
-            ], dtype=np.float32),
-            "region_mixture": (
-                np.asarray(region_mixture, dtype=np.float32)
-                if region_mixture is not None
-                else self._region_mixture_state.astype(np.float32)
-            ),
-            "coverage_center": (
-                np.asarray(coverage_center, dtype=np.float32)
-                if coverage_center is not None
-                else self._footprint_center.astype(np.float32)
-            ),
-            "coverage_phase": np.array([
-                coverage_phase if coverage_phase is not None else self._coverage_phase
-            ], dtype=np.float32),
-            "pending_backoff_cbra": np.array([
-                pending_backoff_cbra
-                if pending_backoff_cbra is not None
-                else float(self._backoff_queue_cbra.sum())
-            ], dtype=np.float32),
-            "pending_backoff_pbra": np.array([
-                pending_backoff_pbra
-                if pending_backoff_pbra is not None
-                else float(self._backoff_queue_pbra.sum())
-            ], dtype=np.float32),
-        }
-        return observation
-
-    def _update_history(self, value: float) -> None:
-        """滚动更新历史统计。"""
-
-        self._history = np.roll(self._history, shift=-1)
-        self._history[-1] = value
-
-    def _apply_preamble_adjustment(self, *, cbra_adj: float, pbra_adj: float) -> Tuple[float, float, float]:
-        """根据动作调整 CBRA/PBRA/CFRA 资源分配。"""
-
-        deltas = np.array([round(cbra_adj), round(pbra_adj), 0], dtype=np.float32)
-        updated = self._current_preambles.copy()
-        updated[0] = np.clip(updated[0] + deltas[0], 0, self.config.total_preambles)
-        updated[1] = np.clip(updated[1] + deltas[1], 0, self.config.total_preambles)
-
-        overflow = updated[0] + updated[1] - self.config.total_preambles
-        if overflow > 0:
-            reduce_pbra = min(overflow, updated[1])
-            updated[1] -= reduce_pbra
-            overflow -= reduce_pbra
-            if overflow > 0:
-                updated[0] = max(updated[0] - overflow, 0)
-
-        updated[2] = self.config.total_preambles - updated[0] - updated[1]
-
-        if updated[2] < 0:
-            deficit = -updated[2]
-            updated[2] = 0
-            if updated[1] > updated[0]:
-                updated[1] = max(updated[1] - deficit, 0)
-            else:
-                updated[0] = max(updated[0] - deficit, 0)
-        updated[2] = self.config.total_preambles - updated[0] - updated[1]
-
-        self._current_preambles = updated
-        return float(updated[0]), float(updated[1]), float(updated[2])
-
-    def _update_region_mixture(self, num_slots: int) -> np.ndarray:
-        """更新覆盖权重向量，实现区域的平滑过渡。"""
-
-        if not self._coverage_patches:
-            if self._current_region_idx is None:
-                idx = int(self._rng.choice(self._region_count, p=self._region_prob))
-            else:
-                transition = self._transition_matrix[self._current_region_idx]
-                idx = int(self._rng.choice(self._region_count, p=transition))
-            mixture = np.zeros(self._region_count, dtype=np.float32)
-            mixture[idx] = 1.0
-            self._region_mixture_state = mixture
-            self._current_region_idx = idx
-            return self._region_mixture_state
-
-        cycle = max(float(self.config.coverage_cycle_slots), 1e-6)
-        self._coverage_phase = (self._coverage_phase + num_slots / cycle) % 1.0
-        angle = 2.0 * np.pi * self._coverage_phase
-
-        target_center = np.array(
-            [
-                self.config.coverage_drift_radius * np.cos(angle),
-                self.config.coverage_drift_radius * np.sin(angle),
-            ],
-            dtype=np.float32,
-        )
-
-        if self.config.coverage_jitter > 0.0:
-            jitter = self._rng.normal(0.0, self.config.coverage_jitter, size=2).astype(np.float32)
-            target_center += jitter
-
-        smoothing = float(self.config.coverage_smoothing)
-        if smoothing > 0.0:
-            target_center = (1.0 - smoothing) * target_center + smoothing * self._footprint_center
-        self._footprint_center = target_center.astype(np.float32)
-
-        weights = self._coverage_reference * self._region_prob.astype(np.float64)
-        center_vec = self._footprint_center.astype(np.float64)
-        for patch in self._coverage_patches:
-            patch_center = np.asarray(patch.center, dtype=np.float64)
-            diff = center_vec - patch_center
-            dist = float(np.linalg.norm(diff))
-            influence = patch.strength * np.exp(-0.5 * (dist / patch.radius) ** 2)
-            if influence <= 0.0:
-                continue
-            weights += influence * np.asarray(patch.region_weights, dtype=np.float64)
-
-        weights = np.clip(weights, 0.0, None)
-        total = float(weights.sum())
-        if total <= 0.0:
-            weights = self._region_prob.astype(np.float64)
-            total = float(weights.sum())
-        if total <= 0.0:
-            weights = np.full(self._region_count, 1.0 / max(self._region_count, 1), dtype=np.float64)
-        else:
-            weights /= total
-
-        if smoothing > 0.0:
-            weights = (1.0 - smoothing) * weights + smoothing * self._region_mixture_state.astype(np.float64)
-            weights = np.clip(weights, 1e-8, None)
-            weights /= float(weights.sum())
-
-        self._region_mixture_state = weights.astype(np.float32)
-        return self._region_mixture_state
-
-    def _current_preamble_ratio(self) -> np.ndarray:
-        return self._current_preambles / max(self.config.total_preambles, 1)
-
-    def _pop_backoff_queue(self, queue: np.ndarray, steps: int) -> float:
-        """释放在给定步数内到期的退避重试。"""
-
-        if steps <= 0:
-            return 0.0
-        max_index = len(queue) - 1
-        steps = int(min(max(steps, 0), max_index))
-        slice_end = steps + 1
-        due = float(np.sum(queue[:slice_end]))
-        if slice_end >= len(queue):
-            queue.fill(0.0)
-        else:
-            remaining = queue[slice_end:]
-            queue[: len(remaining)] = remaining
-            queue[len(remaining) :] = 0.0
-        return due
-
-    def _schedule_backoff(self, queue: np.ndarray, amount: float, window: BackoffWindow) -> None:
-        """按照退避窗口为碰撞的终端重新排队。"""
-
-        if amount <= 0.0:
-            return
-        min_step = max(int(window.min_steps), 0)
-        max_step = max(int(window.max_steps), min_step)
-        max_index = len(queue) - 1
-        min_step = min(min_step, max_index)
-        max_step = min(max_step, max_index)
-        if max_step <= min_step:
-            queue[min_step] += float(amount)
-            return
-        bins = max_step - min_step + 1
-        weights = self._rng.dirichlet(np.ones(bins, dtype=np.float64))
-        for offset, weight in enumerate(weights):
-            step = min_step + offset
-            queue[step] += float(amount * weight)
+    def _new_coverage_length(self, current_components: List[Tuple[float, float]]) -> float:
+        prev = self._prev_components
+        current_length = sum(end - start for start, end in current_components)
+        overlap = 0.0
+        for c_start, c_end in current_components:
+            for p_start, p_end in prev:
+                overlap += _interval_overlap(c_start, c_end, p_start, p_end)
+        return max(current_length - overlap, 0.0)
 
     def _select_backoff_window(self, collision_ratio: float) -> BackoffWindow:
-        """根据碰撞率选择退避窗口。"""
-
-        strategy = self._backoff_strategy
+        strategy = self.config.backoff_strategy
         if collision_ratio >= strategy.collision_threshold_high:
             return strategy.high
         if collision_ratio >= strategy.collision_threshold_medium:
             return strategy.medium
         return strategy.low
 
-    def _apply_slot_buffer(
+    def _schedule_backoff(
+        self,
+        queue: np.ndarray,
+        amount: float,
+        window: BackoffWindow,
+    ) -> None:
+        if amount <= 0.0:
+            return
+        queue_len = queue.shape[0]
+        start_idx = max(0, min(window.min_steps, queue_len - 1))
+        end_idx = max(0, min(window.max_steps, queue_len - 1))
+        if end_idx < start_idx:
+            end_idx = start_idx
+        span = end_idx - start_idx + 1
+        increment = amount / span
+        queue[start_idx : end_idx + 1] += increment
+
+    def _pop_backoff_queue(self, queue: np.ndarray, steps: int) -> float:
+        if steps <= 0:
+            return 0.0
+        released = 0.0
+        steps = min(steps, queue.shape[0])
+        for _ in range(steps):
+            released += float(queue[0])
+            queue[0] = 0.0
+            queue[:-1] = queue[1:]
+            queue[-1] = 0.0
+            released += float(queue[0])
+            queue[0] = 0.0
+        return released
+
+    def _update_history(self, stats: np.ndarray) -> None:
+        self._history_buffer[self._history_index] = stats
+        self._history_index = (self._history_index + 1) % self._history_buffer.shape[0]
+
+    def _update_preamble_usage(
         self,
         *,
-        slot_requests: np.ndarray,
-        capacity: float,
-        queue: Optional[np.ndarray] = None,
-    ) -> Tuple[float, float]:
-        """按照 slot 粒度计算成功与碰撞数量，并在 slot 级别安排退避。"""
+        cbra_util: float = 0.0,
+        pbra_util: float = 0.0,
+        cfra_util: float = 0.0,
+        reset: bool = False,
+    ) -> None:
+        if reset:
+            self._preamble_usage.fill(0.0)
+            return
+        util = np.array(
+            [cbra_util, cbra_util, cbra_util, pbra_util, pbra_util, pbra_util, cfra_util, cfra_util],
+            dtype=np.float32,
+        )
+        self._preamble_usage = 0.9 * self._preamble_usage + 0.1 * util
 
-        if capacity <= 0.0:
-            total_requests = float(np.sum(slot_requests))
-            if queue is not None and total_requests > 0.0:
-                window = self._select_backoff_window(1.0)
-                self._schedule_backoff(queue, total_requests, window)
-            return 0.0, total_requests
+    def _update_region_mixture(self, components: List[Tuple[float, float]]) -> None:
+        region_lengths = np.zeros((len(self.config.regions),), dtype=np.float32)
+        for comp_start, comp_end in components:
+            for seg_start, seg_end, segment in self._segments:
+                overlap = _interval_overlap(comp_start, comp_end, seg_start, seg_end)
+                if overlap <= 0.0:
+                    continue
+                region_idx = self._region_index[segment.region_name]
+                region_lengths[region_idx] += overlap
+        total_length = float(np.sum(region_lengths))
+        if total_length > 0.0:
+            self._region_mixture = (region_lengths / total_length).astype(np.float32)
+        else:
+            self._region_mixture = np.full(len(self.config.regions), 1.0 / len(self.config.regions), dtype=np.float32)
 
-        slot_requests = np.asarray(slot_requests, dtype=np.float64)
-        success_total = 0.0
-        collision_total = 0.0
-        eps = 1e-6
-        for slot_value in slot_requests:
-            slot_value = max(float(slot_value), 0.0)
-            slot_success, slot_collision = self._single_slot_competition(
-                slot_requests=slot_value,
-                capacity=capacity,
-            )
-            success_total += slot_success
-            collision_total += slot_collision
-            if queue is not None and slot_collision > 0.0:
-                slot_ratio = slot_collision / max(slot_value, eps)
-                window = self._select_backoff_window(slot_ratio)
-                self._schedule_backoff(queue, float(slot_collision), window)
-        return success_total, collision_total
+    def _build_observation(self) -> Dict[str, np.ndarray]:
+        preamble_ratio = (self._preamble_allocation / self.config.total_preambles).astype(np.float32)
+        history_flat = self._history_buffer.reshape(-1)
+        return {
+            "requests_cbra": np.array([
+                self._last_requests_cbra / self._request_scale
+            ], dtype=np.float32),
+            "requests_pbra": np.array([
+                self._last_requests_pbra / self._request_scale
+            ], dtype=np.float32),
+            "collision_ratio_cbra": np.array([self._last_collision_ratio_cbra], dtype=np.float32),
+            "collision_ratio_pbra": np.array([self._last_collision_ratio_pbra], dtype=np.float32),
+            "active_terminals_dist": self._active_terminals.astype(np.float32),
+            "preamble_usage": self._preamble_usage.astype(np.float32),
+            "preamble_allocation": preamble_ratio,
+            "current_ACB_factor": np.array([self._current_acb], dtype=np.float32),
+            "history_stats": history_flat.astype(np.float32),
+            "pending_backoff_cbra": np.array(
+                [float(np.sum(self._backoff_queue_cbra)) / self._backoff_scale], dtype=np.float32
+            ),
+            "pending_backoff_pbra": np.array(
+                [float(np.sum(self._backoff_queue_pbra)) / self._backoff_scale], dtype=np.float32
+            ),
+            "region_mixture": self._region_mixture.astype(np.float32),
+            "coverage_center": np.array([self._coverage_center, 0.0], dtype=np.float32),
+            "coverage_phase": np.array([self._coverage_phase], dtype=np.float32),
+        }
 
-    @staticmethod
-    def _single_slot_competition(slot_requests: float, capacity: float) -> Tuple[float, float]:
-        """根据单个 slot 的接入请求与每个 preamble 的平均负载计算成功/碰撞。"""
+    def _build_info(self, aggregates: Dict[str, float]) -> Dict[str, np.ndarray]:
+        info: Dict[str, np.ndarray] = {
+            "throughput": np.array([aggregates["throughput"]], dtype=np.float32),
+            "success_total": np.array([self._success_total], dtype=np.float32),
+            "collision_total": np.array([self._collision_total], dtype=np.float32),
+            "success_cbra": np.array([aggregates["success_cbra"]], dtype=np.float32),
+            "success_pbra": np.array([aggregates["success_pbra"]], dtype=np.float32),
+            "success_cfra": np.array([aggregates["success_cfra"]], dtype=np.float32),
+            "collision_cbra": np.array([aggregates["collision_cbra"]], dtype=np.float32),
+            "collision_pbra": np.array([aggregates["collision_pbra"]], dtype=np.float32),
+            "collision_cfra": np.array([aggregates["collision_cfra"]], dtype=np.float32),
+            "pending_backoff_cbra": np.array([float(np.sum(self._backoff_queue_cbra))], dtype=np.float32),
+            "pending_backoff_pbra": np.array([float(np.sum(self._backoff_queue_pbra))], dtype=np.float32),
+            "collision_ratio_cbra": np.array([self._last_collision_ratio_cbra], dtype=np.float32),
+            "collision_ratio_pbra": np.array([self._last_collision_ratio_pbra], dtype=np.float32),
+            "region_mixture": self._region_mixture.astype(np.float32),
+            "preamble_allocation": (
+                self._preamble_allocation
+            ).astype(np.int16),
+            "preamble_allocation_counts": self._preamble_allocation.astype(np.float32),
+            "preamble_usage": self._preamble_usage.astype(np.float32),
+        }
+        return info
 
-        if slot_requests <= 0.0 or capacity <= 0.0:
-            return 0.0, max(slot_requests, 0.0)
+    def _project_preamble_allocation(self, allocation: np.ndarray) -> np.ndarray:
+        projected = allocation.astype(int)
+        total = self.config.total_preambles
+        projected = np.clip(projected, 1, total - 2)
+        projected[2] = total - projected[0] - projected[1]
+        if projected[2] < 1:
+            if projected[0] > projected[1]:
+                projected[0] = max(1, projected[0] - (1 - projected[2]))
+            else:
+                projected[1] = max(1, projected[1] - (1 - projected[2]))
+            projected[2] = total - projected[0] - projected[1]
+        if projected[2] < 1:
+            # As a final guard, distribute evenly while respecting minimum of one per class.
+            base = max(total // 3, 1)
+            projected = np.array([base, base, base], dtype=int)
+            remainder = total - int(np.sum(projected))
+            for idx in range(3):
+                if remainder <= 0:
+                    break
+                projected[idx] += 1
+                remainder -= 1
+        return projected.astype(np.int32)
 
-        load_per_preamble = slot_requests / capacity
-        if load_per_preamble <= 1.0:
-            return slot_requests, 0.0
-        if load_per_preamble >= 2.0:
-            return 0.0, slot_requests
 
-        success = capacity * (2.0 - load_per_preamble)
-        success = max(min(success, slot_requests), 0.0)
-        collision = slot_requests - success
-        return success, collision
+# --- Utility functions ------------------------------------------------------------
+
+
+def _interval_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+# --- Default configuration factory ------------------------------------------------
 
 
 def default_simulator_config() -> MACSimulatorConfig:
-    """提供一个默认的区域配置，用于占位测试。"""
-
-    return MACSimulatorConfig(
-        regions=(
-            RegionTrafficProfile(
-                name="urban",
-                area_weight=0.4,
-                cbra_density=1.2,
-                pbra_density=1.5,
-                handover_intensity=0.8,
-                scheduling_period=160,
-                noise_scale=0.2,
-                cox_intensity_mean=1.6,
-                cox_intensity_variance=0.7,
-                cox_grid=(10, 10),
-                region_bounds=(-2.0, 2.0, -2.0, 2.0),
-                batch_mean=60.0,
-                batch_std=0.6,
-                residence_time_mean=20,
-            ),
-            RegionTrafficProfile(
-                name="suburban",
-                area_weight=0.35,
-                cbra_density=0.8,
-                pbra_density=0.9,
-                handover_intensity=0.5,
-                scheduling_period=200,
-                noise_scale=0.15,
-                cox_intensity_mean=1.2,
-                cox_intensity_variance=0.5,
-                cox_grid=(8, 8),
-                region_bounds=(-1.5, 1.5, -1.5, 1.5),
-                batch_mean=8.0,
-                batch_std=0.5,
-                residence_time_mean=6.0,
-            ),
-            RegionTrafficProfile(
-                name="rural",
-                area_weight=0.25,
-                cbra_density=0.3,
-                pbra_density=0.4,
-                handover_intensity=0.2,
-                scheduling_period=320,
-                noise_scale=0.1,
-                cox_intensity_mean=0.9,
-                cox_intensity_variance=0.3,
-                cox_grid=(6, 6),
-                region_bounds=(-1.0, 1.0, -1.0, 1.0),
-                batch_mean=4.0,
-                batch_std=0.4,
-                residence_time_mean=4.5,
-            ),
-        ),
+    regions = (
+        RegionTrafficProfile(name="suburban", cbra_density=3.0 * 0.2, pbra_density=3.0 * 0.75, cfra_density=3.0 * 0.05),
+        RegionTrafficProfile(name="periurban", cbra_density=4.0 * 0.2, pbra_density=4.0 * 0.75, cfra_density=4.0 * 0.05),
+        RegionTrafficProfile(name="urban", cbra_density=100.0 * 0.85, pbra_density=100.0 * 0.1, cfra_density=100.0 * 0.05),
     )
+    pattern: Sequence[Tuple[str, float]] = (
+        ("suburban", 2.0),
+        ("periurban", 1.0),
+        ("urban", 5.0),
+        ("periurban", 1.0),
+        ("suburban", 2.0),
+    )
+    segments: List[RegionSegment] = []
+    for _ in range(1):
+        for name, length in pattern:
+            segments.append(RegionSegment(region_name=name, length=length))
+    return MACSimulatorConfig(regions=regions, segments=tuple(segments))
+
+
+__all__ = [
+    "MACSimulator",
+    "MACSimulatorConfig",
+    "BackoffWindow",
+    "BackoffStrategyConfig",
+    "RegionTrafficProfile",
+    "RegionSegment",
+    "default_simulator_config",
+    "MAC_PROTOCOL_COUNT",
+    "PREAMBLE_SUBSET_COUNT",
+    "DEFAULT_TOTAL_PREAMBLES",
+    "HISTORY_DIM",
+]
