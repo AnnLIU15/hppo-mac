@@ -49,7 +49,7 @@ logs/                    # 自动生成的仿真输出、扫参结果、telemetr
 
 ### Gymnasium 环境 `SatelliteMACEnv`
 
-- 自动构建动作空间：`delta_combo`（CBRA/PBRA 组合离散动作）与 `q_ACB` （连续）。
+- 自动构建动作空间：`delta_cbra` / `delta_pbra`（独立离散分支）与 `q_ACB` （连续）。
 - 观测包含当前退避累积、区域混合、历史奖励序列等；可生成扁平向量或保持字典形式。
 - `configure_access_state` 提供外部调节入口，便于单元测试或策略初始化。
 
@@ -154,8 +154,9 @@ class SatelliteMACEnv(gym.Env):
         # 动作空间：组合离散动作 + 1个连续动作
         # a_t = (a_{t, combo}, a_{t, c})
         self.action_space = spaces.Dict({
-            # delta_combo: CBRA/PBRA delta 组合 (例如 delta_range=1 -> 3*3=9 种组合)
-            "delta_combo": spaces.Discrete(9),
+            # delta 分支：CBRA/PBRA 各自的增量 (例如 delta_range=1 -> 3 个离散取值)
+            "delta_cbra": spaces.Discrete(3),
+            "delta_pbra": spaces.Discrete(3),
             # c: ACB 因子 q_ACB (0到1之间的连续值)
             "q_ACB": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
         })
@@ -186,14 +187,15 @@ class SatelliteMACEnv(gym.Env):
         # S23：执行动作，状态转移，反馈观测与奖励
 
     # 1. 解析动作 a_t
-    combo_idx = action  # delta_combo 离散动作 (0..N-1)
-    q_ACB = action      # 连续动作 (0.0 to 1.0)
+    delta_cbra_idx = action["delta_cbra"]  # 离散动作索引 (0 .. bins-1)
+    delta_pbra_idx = action["delta_pbra"]
+    q_ACB = action["q_ACB"]              # 连续动作 (0.0 to 1.0)
 
-    # 将组合索引拆解为实际参数调整量（例如：-1, 0, 1）
+    # 将离散索引映射为实际增量（例如：-1, 0, 1）
     delta_range = 1
     bins = 2 * delta_range + 1
-    d1_change = combo_idx // bins - delta_range
-    d2_change = combo_idx % bins - delta_range
+    d1_change = delta_cbra_idx - delta_range
+    d2_change = delta_pbra_idx - delta_range
 
         # 2. 仿真环境执行动作：更新 MAC 参数
         new_MAC_params = {

@@ -9,7 +9,6 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 from gymnasium.utils import seeding
-from loguru import logger
 from .mac_simulator import (
     MACSimulator,
     MACSimulatorConfig,
@@ -33,17 +32,20 @@ class SatelliteMACEnvConfig:
 
 
 class SatelliteMACEnv(gym.Env):
-    """面向 PPO 训练的卫星 MAC 环境。"""
+    """面向 RL 训练的卫星 MAC 环境。"""
 
     metadata = {"render_modes": []}
 
     def __init__(self, config: Optional[SatelliteMACEnvConfig] = None, **kwargs) -> None:
         # TorchRL 的 GymEnv 会通过 make_kwargs 传递配置，这里兼容该行为。
         make_kwargs = kwargs.pop("make_kwargs", None)
+        print(config)
         config = kwargs.pop("config", config)
         if make_kwargs:
             config = make_kwargs.get("config", config)
+
         self.config = config or SatelliteMACEnvConfig()
+        print("config",self.config.preamble_delta_range)
         sim_config = self.config.simulator_config or default_simulator_config()
         self.simulator = MACSimulator(sim_config)
         self._region_count = len(self.simulator.config.regions)
@@ -60,20 +62,15 @@ class SatelliteMACEnv(gym.Env):
         self._delta_range = max(1, int(self.config.preamble_delta_range))
         self._delta_values = np.arange(-self._delta_range, self._delta_range + 1, dtype=np.int64)
         self._delta_bins = int(self._delta_values.size)
-        self._delta_pairs = [
-            (int(delta_cbra), int(delta_pbra))
-            for delta_cbra in self._delta_values
-            for delta_pbra in self._delta_values
-        ]
-        self._combo_count = len(self._delta_pairs)
         self._flat_observation = bool(self.config.flatten_observation)
 
-        combo_space = spaces.Discrete(self._combo_count)
+        delta_space = spaces.Discrete(self._delta_bins)
         q_acb_box = spaces.Box(low=np.zeros((1,), dtype=np.float32), high=np.ones((1,), dtype=np.float32), dtype=np.float32)
 
         self.action_space = spaces.Dict(
             {
-                "delta_combo": combo_space,
+                "delta_cbra": delta_space,
+                "delta_pbra": delta_space,
                 "q_ACB": q_acb_box,
             }
         )
@@ -138,21 +135,26 @@ class SatelliteMACEnv(gym.Env):
         self._init_history_buffer(observation_dict)
         observation_dict["recent_stats"] = self._recent_stats_array()
         observation = self._format_observation(observation_dict)
-        combo_mask = self._delta_combo_mask()
         info = {
             "step": self._step_count,
-            "delta_combo_mask": combo_mask,
+            "action_valid": 1.0,
         }
         return observation, info
 
     def step(
         self,
         action: Dict[str, np.ndarray],
+        need_parse_action : bool = True,
     ) -> Tuple[Union[np.ndarray, Dict[str, np.ndarray]], float, bool, bool, Dict[str, float]]:
         """执行一步决策。"""
-
-        parsed_action = self._parse_action(action)
-        # logger.info(f'parsed_action {parsed_action}')
+        if need_parse_action:
+            parsed_action = self._parse_action(action)
+        else:
+            parsed_action = {
+            "M_CBRA": float(action["delta_cbra"].item()),
+            "M_PBRA": float(action["delta_pbra"].item()),
+            "q_ACB": float(action["q_ACB"].item()),
+        }
         reward, next_state, sim_info = self.simulator.run_slots(
             num_slots=self.config.num_slots_per_step,
             params=parsed_action,
@@ -167,10 +169,9 @@ class SatelliteMACEnv(gym.Env):
 
         observation = self._format_observation(next_state)
 
-        combo_mask = self._delta_combo_mask()
         info = {
             "step": self._step_count,
-            "delta_combo_mask": combo_mask,
+            "action_valid": 1.0,
         }
         for key, value in sim_info.items():
             if isinstance(value, (float, int, str)):
@@ -190,7 +191,8 @@ class SatelliteMACEnv(gym.Env):
         """将策略输出的动作转换为仿真器可识别的格式。"""
 
         try:
-            delta_cbra, delta_pbra = self._decode_combo_component(action["delta_combo"])
+            delta_cbra = self._decode_delta_component(action["delta_cbra"])
+            delta_pbra = self._decode_delta_component(action["delta_pbra"])
             q_acb_raw = np.asarray(action["q_ACB"], dtype=np.float32).reshape(-1)
         except KeyError as err:
             raise ValueError("缺少必要的动作分量。") from err
@@ -203,36 +205,24 @@ class SatelliteMACEnv(gym.Env):
             "q_ACB": float(q_acb),
         }
 
-    def _decode_combo_component(self, raw_component: Union[int, float, np.ndarray]) -> Tuple[float, float]:
-        """将离散组合动作索引或独热向量映射为 (delta_cbra, delta_pbra)。"""
+    def _decode_delta_component(self, raw_component: Union[int, float, np.ndarray]) -> float:
+        """解析离散动作分量为整数增量。"""
 
         values = np.asarray(raw_component).astype(np.float32).reshape(-1)
-        if values.size == self._combo_count:
+        if values.size == self._delta_bins:
             idx = int(np.argmax(values))
         elif values.size == 1:
             idx = int(values.item())
         else:
-            raise ValueError("无法解析给定的组合动作分量。")
-        idx = int(np.clip(idx, 0, self._combo_count - 1))
-        delta_cbra, delta_pbra = self._delta_pairs[idx]
-        return float(delta_cbra), float(delta_pbra)
+            raise ValueError("无法解析给定的离散动作分量。")
+        idx = int(np.clip(idx, 0, self._delta_bins - 1))
+        return float(self._delta_values[idx])
 
-    def encode_delta_combo(self, delta_cbra: int, delta_pbra: int) -> int:
-        """将给定的增量对编码为组合动作索引（便于脚本与基线策略使用）。"""
+    def encode_delta_index(self, delta: int) -> int:
+        """将给定增量编码为离散动作索引。"""
 
-        clipped_cbra = int(np.clip(delta_cbra, -self._delta_range, self._delta_range))
-        clipped_pbra = int(np.clip(delta_pbra, -self._delta_range, self._delta_range))
-        cbra_idx = clipped_cbra + self._delta_range
-        pbra_idx = clipped_pbra + self._delta_range
-        return cbra_idx * self._delta_bins + pbra_idx
-
-    def _delta_combo_mask(self) -> np.ndarray:
-        """获取当前时刻可行的 delta 组合掩码。"""
-
-        mask = self.simulator.compute_combo_mask(self._delta_pairs)
-        if mask.dtype != np.float32:
-            mask = mask.astype(np.float32)
-        return mask
+        clipped = int(np.clip(delta, -self._delta_range, self._delta_range))
+        return clipped + self._delta_range
 
     def configure_access_state(
         self,

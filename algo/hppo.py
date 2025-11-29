@@ -186,34 +186,18 @@ def _kaiming_init(module: nn.Module) -> None:
 class _PolicyParamExtractor(nn.Module):
     """Maps latent features to distribution parameters for each action head."""
 
-    def __init__(self, feature_dim: int, combo_bins: int, *, mask_penalty: float = -1e9) -> None:
+    def __init__(self, feature_dim: int, delta_bins: int) -> None:
         super().__init__()
-        self.combo_head = nn.Linear(feature_dim, combo_bins)
-        self.mask_penalty = float(mask_penalty)
+        self.cbra_head = nn.Linear(feature_dim, delta_bins)
+        self.pbra_head = nn.Linear(feature_dim, delta_bins)
         self.acb_head = nn.Linear(feature_dim, 2)
 
-    def forward(
-        self,
-        features: torch.Tensor,
-        delta_combo_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, ...]:
-        logits_combo = self.combo_head(features)
-        if delta_combo_mask is not None:
-            mask = delta_combo_mask.to(dtype=logits_combo.dtype, device=logits_combo.device)
-            while mask.ndim < logits_combo.ndim:
-                mask = mask.unsqueeze(0)
-            mask = mask.expand_as(logits_combo)
-            valid_mask = mask > 0.5
-            has_valid = valid_mask.any(dim=-1, keepdim=True)
-            if not torch.all(has_valid):
-                fallback = torch.ones_like(valid_mask, dtype=torch.bool)
-                valid_mask = torch.where(has_valid, valid_mask, fallback)
-            penalty = torch.full_like(logits_combo, self.mask_penalty)
-            logits_combo = torch.where(valid_mask, logits_combo, penalty)
-        # logits_combo = torch.clamp(logits_combo, min=-50.0, max=50.0)
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        logits_cbra = self.cbra_head(features)
+        logits_pbra = self.pbra_head(features)
         acb_params = self.acb_head(features)
         acb_mean, acb_log_std = acb_params.chunk(2, dim=-1)
-        return logits_combo, acb_mean, acb_log_std
+        return logits_cbra, logits_pbra, acb_mean, acb_log_std
 
 
 class _FeatureEncoder(nn.Module):
@@ -508,12 +492,12 @@ def build_hppo_modules(
     observation_spec = env.observation_spec["observation"]
     action_spec = env.action_spec
     obs_dim = observation_spec.shape[-1]
-    combo_spec = action_spec.get("delta_combo")
-    if combo_spec is None:
-        raise KeyError("Combined RA delta head `delta_combo` missing from action spec.")
+    delta_spec = action_spec.get("delta_cbra")
+    if delta_spec is None:
+        raise KeyError("Discrete head `delta_cbra` missing from action spec.")
 
     try:
-        combo_bins = int(combo_spec.space.n)
+        delta_bins = int(delta_spec.space.n)
     except AttributeError as err:
         raise ValueError("Discrete heads must expose a categorical cardinality via `space.n`.") from err
 
@@ -524,13 +508,14 @@ def build_hppo_modules(
         in_keys=["observation"],
         out_keys=["state_feature"],
     )
-    param_extractor = _PolicyParamExtractor(feature_dim, combo_bins)
+    param_extractor = _PolicyParamExtractor(feature_dim, delta_bins)
     param_extractor.apply(_kaiming_init)
     policy_params = TensorDictModule(
         param_extractor,
-        in_keys=["state_feature", ("info", "delta_combo_mask")],
+        in_keys=["state_feature"],
         out_keys=[
-            ("params", "delta_combo", "logits"),
+            ("params", "delta_cbra", "logits"),
+            ("params", "delta_pbra", "logits"),
             ("params", "q_ACB", "mean"),
             ("params", "q_ACB", "log_std"),
         ],
@@ -548,7 +533,8 @@ def build_hppo_modules(
         distribution_class=CompositeDistribution,
         distribution_kwargs={
             "distribution_map": {
-                "delta_combo": OneHotCategorical,
+                "delta_cbra": OneHotCategorical,
+                "delta_pbra": OneHotCategorical,
                 "q_ACB": TanhNormal01,
             }
         },
@@ -608,7 +594,7 @@ def train_hppo(
         entropy_bonus=True,
         entropy_coeff=config.entropy_coeff,
         normalize_advantage=True,
-        head_keys=("delta_combo", "q_ACB"),
+    head_keys=("delta_cbra", "delta_pbra", "q_ACB"),
     )
 
     actor_opt, critic_opt = _prepare_optimizers(actor, critic, config)

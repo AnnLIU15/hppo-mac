@@ -42,6 +42,7 @@ class StepTrace:
     acb: float
     collision_ratio_cbra: float
     collision_ratio_pbra: float
+    action_valid: float
 
 
 @dataclass(frozen=True)
@@ -69,12 +70,6 @@ def encode_delta(delta: int, delta_range: int) -> int:
     clipped = int(np.clip(delta, -delta_range, delta_range))
     return clipped + delta_range
 
-
-def encode_delta_combo(delta_cbra: int, delta_pbra: int, delta_range: int) -> int:
-    bins = 2 * delta_range + 1
-    idx_cbra = encode_delta(delta_cbra, delta_range)
-    idx_pbra = encode_delta(delta_pbra, delta_range)
-    return idx_cbra * bins + idx_pbra
 
 
 def heuristic_policy(
@@ -124,7 +119,8 @@ def heuristic_policy(
         pbra_delta += rng.integers(-1, 2)
 
     action_dict = {
-        "delta_combo": encode_delta_combo(cbra_delta, pbra_delta, delta_range),
+        "delta_cbra": np.array(encode_delta(cbra_delta, delta_range), dtype=np.int64),
+        "delta_pbra": np.array(encode_delta(pbra_delta, delta_range), dtype=np.int64),
         "q_ACB": np.array([np.clip(acb, 0.0, 1.0)], dtype=np.float32),
     }
     return HeuristicDecision(action_dict, cbra_delta, pbra_delta, float(acb))
@@ -149,6 +145,8 @@ def run_episode(
     delta_range: int,
     rng: np.random.Generator,
     seed: int,
+    fix: bool = False,
+    fix_acb: float = 0.5,
 ) -> Tuple[EpisodeStats, Dict[str, object], List[StepTrace]]:
     observation, info = env.reset(seed=seed)
     validate_info(info)
@@ -156,17 +154,20 @@ def run_episode(
     last_info = info
     traces: List[StepTrace] = []
     heuristic_cfg = HeuristicConfig()
-    cbra_delta=0
-    pbra_delta=0
-    acb_value=0.5,
     done = False
+    env.simulator.configure_access_state(cbra=24,cfra=16,pbra=24)
     while not done:
-        action_dict = {
-            "delta_combo": encode_delta_combo(cbra_delta, pbra_delta, delta_range),
-            "q_ACB": np.array([acb_value], dtype=np.float32),
-        }
-        # decision = heuristic_policy(observation, delta_range, rng, heuristic_cfg)
-        observation, reward, terminated, truncated, info = env.step(action_dict)
+        if not fix:
+            decision = heuristic_policy(observation, delta_range, rng, heuristic_cfg)
+        else:
+            action_dict = {
+                "delta_cbra": np.array([0], dtype=np.int64),
+                "delta_pbra": np.array([0], dtype=np.int64),
+                "q_ACB": np.array([fix_acb], dtype=np.float32),
+            }
+            decision = HeuristicDecision(action_dict, 0, 0, fix_acb)
+
+        observation, reward, terminated, truncated, info = env.step(decision.action, need_parse_action=False)
         validate_info(info)
 
         stats.steps += 1
@@ -184,11 +185,12 @@ def run_episode(
                 collisions=float(info.get("collision_total", 0.0)),
                 backlog_cbra=float(info.get("pending_backoff_cbra", 0.0)),
                 backlog_pbra=float(info.get("pending_backoff_pbra", 0.0)),
-                cbra_delta=cbra_delta,
-                pbra_delta=pbra_delta,
-                acb=acb_value,
+                cbra_delta=decision.cbra_delta,
+                pbra_delta=decision.pbra_delta,
+                acb=decision.acb_value,
                 collision_ratio_cbra=float(info.get("collision_ratio_cbra", 0.0)),
                 collision_ratio_pbra=float(info.get("collision_ratio_pbra", 0.0)),
+                action_valid=float(info.get("action_valid", 1.0)),
             )
         )
 
@@ -327,8 +329,8 @@ def parameter_sweep(
                     )
                     env = SatelliteMACEnv(env_config)
                     action_space = env.action_space
-                    combo_bins = int(np.sqrt(action_space["delta_combo"].n))
-                    effective_delta = (combo_bins - 1) // 2
+                    branch_bins = int(action_space["delta_cbra"].n)
+                    effective_delta = (branch_bins - 1) // 2
                     aggregate = []
                     for seed in seeds:
                         stats, _, _ = run_episode(env, effective_delta, rng, seed)
@@ -394,8 +396,8 @@ def main() -> None:
     rng = np.random.default_rng(20251106)
 
     action_space = env.action_space
-    combo_bins = int(np.sqrt(action_space["delta_combo"].n))
-    delta_range = (combo_bins - 1) // 2
+    branch_bins = int(action_space["delta_cbra"].n)
+    delta_range = (branch_bins - 1) // 2
 
     episode_rewards = []
     episode_infos = []

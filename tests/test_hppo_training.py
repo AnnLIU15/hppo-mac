@@ -1,17 +1,16 @@
 import torch
 
 from torchrl.envs import TransformedEnv
-from torchrl.envs.libs.gym import GymWrapper
 from torchrl.envs.transforms import Compose, DoubleToFloat
 
 from algo.hppo import HPPOConfig, build_hppo_modules, train_hppo
-from env.satellite_mac_env import SatelliteMACEnv, SatelliteMACEnvConfig
-from env.gym_helpers import with_delta_mask_info
+from env.satellite_mac_env import SatelliteMACEnvConfig
+from env.gym_helpers import build_gym_env
 
 
 def _make_training_env(delta_range: int) -> TransformedEnv:
     config = SatelliteMACEnvConfig(preamble_delta_range=delta_range, flatten_observation=True)
-    base_env = with_delta_mask_info(GymWrapper(SatelliteMACEnv(config=config)))
+    base_env = build_gym_env(config)
     transforms = Compose(DoubleToFloat())
     env = TransformedEnv(base_env, transforms)
     env.set_seed(1234)

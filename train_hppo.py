@@ -16,12 +16,12 @@ from torchrl.envs.libs.gym import GymWrapper
 from torchrl.envs.transforms import Compose, DoubleToFloat
 
 from algo.hppo import HPPOConfig, build_hppo_modules, train_hppo
-from env.satellite_mac_env import SatelliteMACEnv, SatelliteMACEnvConfig
-from env.gym_helpers import with_delta_mask_info
+from env.satellite_mac_env import SatelliteMACEnvConfig
+from env.gym_helpers import build_gym_env
 
 
 def _wrap_env(config: SatelliteMACEnvConfig, seed: Optional[int]) -> GymWrapper:
-    env = with_delta_mask_info(GymWrapper(SatelliteMACEnv(config=config)))
+    env = build_gym_env(config)
     env.set_seed(seed)
     return env
 
@@ -65,7 +65,7 @@ def _parse_args() -> argparse.Namespace:
         "--delta-range",
         type=int,
         default=3,
-        help="Range of CBRA/PBRA integer deltas combined into the joint action head ((2*range+1)^2 bins).",
+        help="Range of CBRA/PBRA integer deltas for each discrete branch (2*range+1 bins per head).",
     )
     parser.add_argument("--decision-horizon", type=int, default=128, help="Maximum number of steps per episode.")
     parser.add_argument(

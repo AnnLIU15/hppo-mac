@@ -23,9 +23,18 @@ def test_run_slots_returns_expected_payload():
     assert info["success_total"].shape == (1,)
     assert info["collision_total"].shape == (1,)
 
-    combo_mask = simulator.compute_combo_mask([(0, 0), (1, -1), (-1, 1)])
-    assert combo_mask.shape == (3,)
-    assert np.all((combo_mask == 0.0) | (combo_mask == 1.0))
+    before_allocation = simulator._preamble_allocation.copy()  # type: ignore[attr-defined]
+    reward_invalid, _, invalid_info = simulator.run_slots(
+        num_slots=40,
+        params={"M_CBRA": float(config.total_preambles), "M_PBRA": 0.0, "q_ACB": 0.4},
+    )
+
+    assert np.isfinite(reward_invalid)
+    action_valid = invalid_info.get("action_valid")
+    assert isinstance(action_valid, np.ndarray)
+    assert action_valid.shape == (1,)
+    assert np.isclose(action_valid.item(), 0.0)
+    assert np.array_equal(simulator._preamble_allocation, before_allocation)  # type: ignore[attr-defined]
 
 
 # def test_run_slots_updates_backoff_queues():

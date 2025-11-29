@@ -35,7 +35,7 @@ This note documents the step-by-step pipeline encoded in `main.ipynb`, highlight
 ### Actor/Critic internals (from `algo/hppo.py`)
 - Observations are fed through a `_FeatureEncoder` MLP (Linear-256-ReLU-Linear-128-ReLU) to produce a shared latent `state_feature`.
 - `_PolicyParamExtractor` produces logits for discrete heads and softplus-transformed concentration parameters for the beta-distributed ACB action.
-- `ProbabilisticActor` wraps the tensor dictionary pipeline with a `CompositeDistribution` that maps keys to `OneHotCategorical` (for CBRA/PBRA deltas) and `Beta` (for `q_ACB`). Log-prob aggregation is enabled to align with ClipPPO’s expectations.
+- `ProbabilisticActor` wraps the tensor dictionary pipeline with a `CompositeDistribution` that maps `delta_cbra`/`delta_pbra` to `OneHotCategorical` branches and `q_ACB` to a custom `TanhNormal01` head. Log-prob aggregation is disabled so each branch contributes an independent PPO ratio.
 - The critic uses a dedicated `_CriticNetwork` (encoder + value head) and returns `state_value` scalars.
 
 ## 5. Training Execution

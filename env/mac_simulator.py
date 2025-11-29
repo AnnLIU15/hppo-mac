@@ -189,8 +189,6 @@ class MACSimulator:
         self._last_collision_ratio_pbra = 0.0
         self._reset_coverage_position()
 
-    # -- Public control surface -----------------------------------------------------
-
     def reseed(self, seed: Optional[int]) -> None:
         if seed is None:
             return
@@ -220,7 +218,6 @@ class MACSimulator:
         if int(np.sum(current)) != total:
             raise ValueError("Allocation must sum to total preambles")
         self._preamble_allocation = np.array(current).astype(int)
-        # self._project_preamble_allocation(current)
         self._update_preamble_usage(reset=True)
 
     def initialize_state(self, seed: Optional[int] = None) -> Dict[str, np.ndarray]:
@@ -257,10 +254,11 @@ class MACSimulator:
         delta_cbra = int(params.get("M_CBRA", 0))
         delta_pbra = int(params.get("M_PBRA", 0))
         self._current_acb = float(np.clip(params.get("q_ACB", 1.0), 0.0, 1.0))
-        self._apply_preamble_delta(delta_cbra, delta_pbra)
+        action_valid = self._apply_preamble_delta(delta_cbra, delta_pbra)
         assert (
             int(np.sum(self._preamble_allocation)) == int(self.config.total_preambles)
         ), "Invalid preamble allocation after applying deltas"
+        print(f'self._preamble_allocation, {self._preamble_allocation}')
         total_success_cbra = 0.0
         total_success_pbra = 0.0
         total_collision_cbra = 0.0
@@ -291,13 +289,13 @@ class MACSimulator:
         success_cfra = min(total_cfra_attempts, available_cfra)
         collision_cfra = max(total_cfra_attempts - success_cfra, 0.0)
 
-        throughput_total = total_success_cbra + total_success_pbra + success_cfra
-        collision_total = total_collision_cbra + total_collision_pbra + collision_cfra
+        throughput_total = total_success_cbra + total_success_pbra
+        collision_total = total_collision_cbra + total_collision_pbra
         total_demand = max(
             1e-10,
             total_admitted_cbra + total_admitted_pbra + total_cfra_attempts,
         )
-        reward_total = throughput_total / total_demand
+        reward_total = (throughput_total) / total_demand - 10 * collision_cfra/total_cfra_attempts
         # (
         #      * self.config.reward_weights["throughput"]
         #     # + collision_total * self.config.reward_weights["collision"]
@@ -370,6 +368,7 @@ class MACSimulator:
         }
         observation = self._build_observation()
         info = self._build_info(aggregates)
+        info["action_valid"] = np.array([1.0 if action_valid else 0.0], dtype=np.float32)
         return reward_total, observation, info
 
     def _snapshot_motion_state(self) -> Tuple[int, float, float, List[Tuple[float, float]], np.ndarray]:
@@ -436,31 +435,23 @@ class MACSimulator:
         self._restore_motion_state(snapshot)
         return cbra_arrivals, pbra_arrivals, cfra_arrivals
 
-    def compute_combo_mask(self, delta_pairs: Sequence[Tuple[int, int]]) -> np.ndarray:
-        mask = np.zeros((len(delta_pairs),), dtype=np.float32)
-        base_allocation = self._preamble_allocation.astype(int)
-        for idx, (delta_cbra, delta_pbra) in enumerate(delta_pairs):
-            trial = base_allocation.copy()
-            trial[0] += int(delta_cbra)
-            trial[1] += int(delta_pbra)
-            projected = self._project_preamble_allocation(trial)
-            if np.min(projected) < 1:
-                continue
-            if int(np.sum(projected)) != self.config.total_preambles:
-                continue
-            mask[idx] = 1.0
-        return mask
-
-    # -- Internal helpers -----------------------------------------------------------
-
-
-    def _apply_preamble_delta(self, delta_cbra: int, delta_pbra: int) -> None:
+    def _apply_preamble_delta(self, delta_cbra: int, delta_pbra: int) -> bool:
         if delta_cbra == 0 and delta_pbra == 0:
-            return
-        allocation = self._preamble_allocation.astype(int)
-        allocation[0] += int(delta_cbra)
-        allocation[1] += int(delta_pbra)
-        self._preamble_allocation = self._project_preamble_allocation(allocation)
+            return True
+
+        base_allocation = self._preamble_allocation.astype(int)
+        proposal = base_allocation.copy()
+        proposal[0] += int(delta_cbra)
+        proposal[1] += int(delta_pbra)
+        proposal[2] = int(self.config.total_preambles) - int(proposal[0]) - int(proposal[1])
+
+        if np.any(proposal < 1):
+            return False
+        if int(np.sum(proposal)) != int(self.config.total_preambles):
+            return False
+
+        self._preamble_allocation = proposal.astype(np.int32)
+        return True
 
     def count_success_and_fail(self, admitted: int, preamble: float) -> Tuple[int, int]:
         if admitted <= 0:
@@ -699,29 +690,6 @@ class MACSimulator:
             "preamble_usage": self._preamble_usage.astype(np.float32),
         }
         return info
-
-    def _project_preamble_allocation(self, allocation: np.ndarray) -> np.ndarray:
-        projected = allocation.astype(int)
-        total = self.config.total_preambles
-        projected = np.clip(projected, 1, total - 2)
-        projected[2] = total - projected[0] - projected[1]
-        if projected[2] < 1:
-            if projected[0] > projected[1]:
-                projected[0] = max(1, projected[0] - (1 - projected[2]))
-            else:
-                projected[1] = max(1, projected[1] - (1 - projected[2]))
-            projected[2] = total - projected[0] - projected[1]
-        if projected[2] < 1:
-            # As a final guard, distribute evenly while respecting minimum of one per class.
-            base = max(total // 3, 1)
-            projected = np.array([base, base, base], dtype=int)
-            remainder = total - int(np.sum(projected))
-            for idx in range(3):
-                if remainder <= 0:
-                    break
-                projected[idx] += 1
-                remainder -= 1
-        return projected.astype(np.int32)
 
 
 # --- Utility functions ------------------------------------------------------------
