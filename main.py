@@ -155,7 +155,7 @@ def run_episode(
     traces: List[StepTrace] = []
     heuristic_cfg = HeuristicConfig()
     done = False
-    env.simulator.configure_access_state(cbra=24,cfra=16,pbra=24)
+    env.simulator.configure_access_state(cbra=31,cfra=2,pbra=31)
     while not done:
         if not fix:
             decision = heuristic_policy(observation, delta_range, rng, heuristic_cfg)

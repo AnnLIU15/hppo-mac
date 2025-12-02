@@ -293,7 +293,7 @@ class MACSimulator:
         collision_total = total_collision_cbra + total_collision_pbra
         total_demand = max(
             1e-10,
-            total_admitted_cbra + total_admitted_pbra + total_cfra_attempts,
+            total_admitted_cbra + total_admitted_pbra,
         )
         reward_total = (throughput_total) / total_demand - 10 * collision_cfra/total_cfra_attempts
         # (
@@ -448,7 +448,7 @@ class MACSimulator:
         if np.any(proposal < 1):
             return False
         if int(np.sum(proposal)) != int(self.config.total_preambles):
-            return False
+            raise RuntimeError("Preamble allocation proposal does not sum to total preambles")
 
         self._preamble_allocation = proposal.astype(np.int32)
         return True
@@ -700,13 +700,20 @@ def _interval_overlap(a_start: float, a_end: float, b_start: float, b_end: float
 
 
 # --- Default configuration factory ------------------------------------------------
-
-
 def default_simulator_config() -> MACSimulatorConfig:
     regions = (
-        RegionTrafficProfile(name="suburban", cbra_density=3.0 * 0.2, pbra_density=3.0 * 0.75, cfra_density=3.0 * 0.05),
-        RegionTrafficProfile(name="periurban", cbra_density=4.0 * 0.2, pbra_density=4.0 * 0.75, cfra_density=4.0 * 0.05),
-        RegionTrafficProfile(name="urban", cbra_density=100.0 * 0.85, pbra_density=100.0 * 0.1, cfra_density=100.0 * 0.05),
+        RegionTrafficProfile(name="suburban",
+                             cbra_density=3.0 * 0.2,
+                             pbra_density=3.0 * 0.75,
+                             cfra_density=3.0 * 0.05),
+        RegionTrafficProfile(name="periurban",
+                             cbra_density=4.0 * 0.2,
+                             pbra_density=4.0 * 0.75,
+                             cfra_density=4.0 * 0.05),
+        RegionTrafficProfile(name="urban",
+                             cbra_density=100.0 * 0.85,
+                             pbra_density=100.0 * 0.1,
+                             cfra_density=100.0 * 0.05),
     )
     pattern: Sequence[Tuple[str, float]] = (
         ("suburban", 2.0),
