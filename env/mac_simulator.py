@@ -295,7 +295,9 @@ class MACSimulator:
             1e-10,
             total_admitted_cbra + total_admitted_pbra,
         )
-        reward_total = (throughput_total) / total_demand - 10 * collision_cfra/total_cfra_attempts
+        # 防止除零错误
+        cfra_penalty = 10 * collision_cfra / max(total_cfra_attempts, 1e-10)
+        reward_total = (throughput_total) / total_demand - cfra_penalty
         # (
         #      * self.config.reward_weights["throughput"]
         #     # + collision_total * self.config.reward_weights["collision"]
@@ -472,51 +474,34 @@ class MACSimulator:
         components = self._current_interval_components()
         self._update_region_mixture(components)
 
-        ready_cbra_int = int(round(ready_cbra))
-        ready_pbra_int = int(round(ready_pbra))
+        ready_cbra_int = int(round(ready_cbra + cbra_new))
+        ready_pbra_int = int(round(ready_pbra + pbra_new))
 
-        allowed_cbra_new = min(int(round(self._current_acb * cbra_new)), int(cbra_new))
-        allowed_pbra_new = min(int(round(self._current_acb * pbra_new)), int(pbra_new))
-        blocked_cbra = max(int(cbra_new) - allowed_cbra_new, 0)
-        blocked_pbra = max(int(pbra_new) - allowed_pbra_new, 0)
-
-        if blocked_cbra > 0:
-            self._schedule_backoff(
-                self._backoff_queue_cbra,
-                float(blocked_cbra),
-                self.config.backoff_strategy.low,
-            )
-        if blocked_pbra > 0:
-            self._schedule_backoff(
-                self._backoff_queue_pbra,
-                float(blocked_pbra),
-                self.config.backoff_strategy.low,
-            )
-
-        total_cbra_pool = allowed_cbra_new + ready_cbra_int
-        total_pbra_pool = allowed_pbra_new + ready_pbra_int
+        allowed_cbra_new = min(int(round(self._current_acb * ready_cbra_int)), int(ready_cbra_int))
+        allowed_pbra_new = min(int(round(self._current_acb * ready_pbra_int)), int(ready_pbra_int))
+        blocked_cbra = max(int(ready_cbra_int) - allowed_cbra_new, 0)
+        blocked_pbra = max(int(ready_pbra_int) - allowed_pbra_new, 0)
 
         success_cbra, collision_cbra = self.count_success_and_fail(
-            total_cbra_pool, int(self._preamble_allocation[0])
+            allowed_cbra_new, int(self._preamble_allocation[0])
         )
         success_pbra, collision_pbra = self.count_success_and_fail(
-            total_pbra_pool, int(self._preamble_allocation[1])
+            allowed_pbra_new, int(self._preamble_allocation[1])
         )
-
-        if collision_cbra > 0:
-            window_cbra = self._select_backoff_window(
-                collision_cbra / max(total_cbra_pool, 1)
+        need_to_backoff_cbra = int(blocked_cbra + collision_cbra)
+        need_to_backoff_pbra = int(blocked_pbra + collision_pbra)
+        if need_to_backoff_cbra > 0:
+            self._schedule_backoff(
+                self._backoff_queue_cbra,
+                float(need_to_backoff_cbra),
+                self.config.backoff_strategy.low,
             )
-            self._schedule_backoff(self._backoff_queue_cbra, float(collision_cbra), window_cbra)
-        if collision_pbra > 0:
-            window_pbra = self._select_backoff_window(
-                collision_pbra / max(total_pbra_pool, 1)
+        if need_to_backoff_pbra > 0:
+            self._schedule_backoff(
+                self._backoff_queue_pbra,
+                float(need_to_backoff_pbra),
+                self.config.backoff_strategy.low,
             )
-            self._schedule_backoff(self._backoff_queue_pbra, float(collision_pbra), window_pbra)
-
-        requests_cbra = success_cbra + collision_cbra
-        requests_pbra = success_pbra + collision_pbra
-
         cfra_attempts = int(max(cfra_demand, 0))
 
         self._prev_components = components
@@ -527,11 +512,11 @@ class MACSimulator:
             "success_pbra": float(success_pbra),
             "collision_cbra": float(collision_cbra),
             "collision_pbra": float(collision_pbra),
-            "requests_cbra": float(requests_cbra),
-            "requests_pbra": float(requests_pbra),
+            "requests_cbra": float(allowed_cbra_new),
+            "requests_pbra": float(allowed_pbra_new),
             "cfra_attempts": float(cfra_attempts),
-            "total_cbra_pool": float(cbra_new + ready_cbra_int),
-            "total_pbra_pool": float(pbra_new + ready_pbra_int),
+            "total_cbra_pool": float(ready_cbra_int),
+            "total_pbra_pool": float(ready_pbra_int),
         }
 
     def _advance_coverage(self) -> None:
@@ -596,11 +581,8 @@ class MACSimulator:
         steps = min(steps, queue.shape[0])
         for _ in range(steps):
             released += float(queue[0])
-            queue[0] = 0.0
             queue[:-1] = queue[1:]
             queue[-1] = 0.0
-            released += float(queue[0])
-            queue[0] = 0.0
         return released
 
     def _update_history(self, stats: np.ndarray) -> None:

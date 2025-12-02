@@ -25,7 +25,6 @@ class SatelliteMACEnvConfig:
 
     num_slots_per_step: int = 160
     decision_horizon: int = 1
-    history_len: int = 4
     simulator_config: Optional[MACSimulatorConfig] = None
     preamble_delta_range: int = 1
     flatten_observation: bool = True
@@ -49,16 +48,6 @@ class SatelliteMACEnv(gym.Env):
         sim_config = self.config.simulator_config or default_simulator_config()
         self.simulator = MACSimulator(sim_config)
         self._region_count = len(self.simulator.config.regions)
-        self._stat_keys = (
-            "requests_cbra",
-            "requests_pbra",
-            "collision_ratio_cbra",
-            "collision_ratio_pbra",
-            "pending_backoff_cbra",
-            "pending_backoff_pbra",
-        )
-        self.history_len = max(1, self.config.history_len)
-        self._recent_stats: List[np.ndarray] = []
         self._delta_range = max(1, int(self.config.preamble_delta_range))
         self._delta_values = np.arange(-self._delta_range, self._delta_range + 1, dtype=np.int64)
         self._delta_bins = int(self._delta_values.size)
@@ -104,12 +93,6 @@ class SatelliteMACEnv(gym.Env):
                     "region_mixture": spaces.Box(low=0.0, high=1.0, shape=(self._region_count,), dtype=np.float32),
                     "coverage_center": spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
                     "coverage_phase": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-                    "recent_stats": spaces.Box(
-                        low=-np.inf,
-                        high=np.inf,
-                        shape=(self.history_len, len(self._stat_keys)),
-                        dtype=np.float32,
-                    ),
                 }
             )
 
@@ -131,10 +114,8 @@ class SatelliteMACEnv(gym.Env):
         self.simulator.reset_access_allocation()
         self.simulator._reset_coverage_position()
         self._step_count = 0
-        observation_dict = self.simulator.initialize_state(seed)
-        self._init_history_buffer(observation_dict)
-        observation_dict["recent_stats"] = self._recent_stats_array()
-        observation = self._format_observation(observation_dict)
+        observation = self.simulator.initialize_state(seed)
+        observation = self._format_observation(observation)
         info = {
             "step": self._step_count,
             "action_valid": 1.0,
@@ -144,17 +125,26 @@ class SatelliteMACEnv(gym.Env):
     def step(
         self,
         action: Dict[str, np.ndarray],
-        need_parse_action : bool = True,
+        need_parse_action: bool = True,
     ) -> Tuple[Union[np.ndarray, Dict[str, np.ndarray]], float, bool, bool, Dict[str, float]]:
-        """执行一步决策。"""
+        """执行一步决策。
+
+        Args:
+            action: 动作字典，包含 delta_cbra, delta_pbra, q_ACB
+            need_parse_action: 是否需要解析动作
+                - True: 用于 PPO 等 RL 算法，需要从离散索引映射到增量值
+                - False: 用于启发式算法，直接传入数值
+        """
         if need_parse_action:
             parsed_action = self._parse_action(action)
         else:
+            # 启发式算法直接传入数值，不需要索引映射
             parsed_action = {
-            "M_CBRA": float(action["delta_cbra"].item()),
-            "M_PBRA": float(action["delta_pbra"].item()),
-            "q_ACB": float(action["q_ACB"].item()),
-        }
+                "M_CBRA": float(action["delta_cbra"].item()),
+                "M_PBRA": float(action["delta_pbra"].item()),
+                "q_ACB": float(action["q_ACB"].item()),
+            }
+
         reward, next_state, sim_info = self.simulator.run_slots(
             num_slots=self.config.num_slots_per_step,
             params=parsed_action,
@@ -163,9 +153,6 @@ class SatelliteMACEnv(gym.Env):
         self._step_count += 1
         truncated = self._step_count >= self.config.decision_horizon
         terminated = False
-
-        self._update_history_buffer(next_state)
-        next_state["recent_stats"] = self._recent_stats_array()
 
         observation = self._format_observation(next_state)
 
@@ -239,28 +226,6 @@ class SatelliteMACEnv(gym.Env):
             cfra=cfra,
         )
 
-    def _init_history_buffer(self, observation: Dict[str, np.ndarray]) -> None:
-        stats_vector = self._extract_stats(observation)
-        self._recent_stats = [stats_vector.copy() for _ in range(self.history_len)]
-
-    def _update_history_buffer(self, observation: Dict[str, np.ndarray]) -> None:
-        stats_vector = self._extract_stats(observation)
-        self._recent_stats.append(stats_vector)
-        if len(self._recent_stats) > self.history_len:
-            self._recent_stats.pop(0)
-
-    def _recent_stats_array(self) -> np.ndarray:
-        if not self._recent_stats:
-            return np.zeros((self.history_len, len(self._stat_keys)), dtype=np.float32)
-        return np.stack(self._recent_stats, axis=0).astype(np.float32)
-
-    def _extract_stats(self, observation: Dict[str, np.ndarray]) -> np.ndarray:
-        values = []
-        for key in self._stat_keys:
-            raw = np.asarray(observation[key], dtype=np.float32).reshape(-1)
-            values.append(float(raw[0]))
-        return np.asarray(values, dtype=np.float32)
-
     def _build_observation_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         inf = np.finfo(np.float32).max
         neg_inf = -np.finfo(np.float32).max
@@ -283,19 +248,6 @@ class SatelliteMACEnv(gym.Env):
         add_component("region_mixture", self._region_count, 0.0, 1.0)
         add_component("coverage_center", 2, neg_inf, inf)
         add_component("coverage_phase", 1, 0.0, 1.0)
-
-        stat_bounds = {
-            "requests_cbra": (0.0, inf),
-            "requests_pbra": (0.0, inf),
-            "collision_ratio_cbra": (0.0, 1.0),
-            "collision_ratio_pbra": (0.0, 1.0),
-            "pending_backoff_cbra": (0.0, inf),
-            "pending_backoff_pbra": (0.0, inf),
-        }
-        for _ in range(self.history_len):
-            for key in self._stat_keys:
-                low, high = stat_bounds[key]
-                add_component(f"recent_stats::{key}", 1, low, high)
 
         self._obs_components = components
 
@@ -327,9 +279,6 @@ class SatelliteMACEnv(gym.Env):
         vectors.append(np.asarray(observation["region_mixture"], dtype=np.float32).reshape(-1))
         vectors.append(np.asarray(observation["coverage_center"], dtype=np.float32).reshape(-1))
         vectors.append(np.asarray(observation["coverage_phase"], dtype=np.float32).reshape(-1))
-
-        stats = np.asarray(observation["recent_stats"], dtype=np.float32)
-        vectors.append(stats.reshape(-1))
 
         flat = np.concatenate(vectors).astype(np.float32)
         return flat

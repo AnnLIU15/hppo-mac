@@ -9,7 +9,10 @@ logging:
 
 environment:
   num_slots: 160
-  history_len: 4
+  # history_size: Simulator层历史缓冲区长度
+  # 注意: 当前实现限制为 10 (history_stats维度 = 10步 × 6维 = 60)
+  # 如需修改，需要同步更新 mac_simulator.py 中的 HISTORY_DIM
+  history_size: 10
   total_preambles: 64
   base_preamble_split: [ 24, 24, 16 ]
   mac_config: default
