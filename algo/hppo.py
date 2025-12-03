@@ -381,7 +381,7 @@ class SplitHeadClipPPOLoss(ClipPPOLoss):
 
             log_weight_scalar = new_lp - old_lp
             if torch.isfinite(log_weight_scalar).all():
-                if (log_weight_scalar > 10000).any() or (log_weight_scalar < -10000).any():
+                if (log_weight_scalar > 10000).any():
                     raise RuntimeError(
                         f"Log-weight overflow for head '{key}'",
                         {

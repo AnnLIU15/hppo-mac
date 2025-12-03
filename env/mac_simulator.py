@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
-
+from loguru import logger
 import numpy as np
 
 # --- Public constants exposed to the environment and policy stacks -----------------
@@ -259,7 +259,6 @@ class MACSimulator:
         if num_slots <= 0:
             raise ValueError("num_slots must be positive")
         arrival_cbra, arrival_pbra, arrival_cfra = self._forecast_arrivals(num_slots)
-
         # 累加本次step的arrivals到episode总计
         self._total_arrivals_cbra += float(np.sum(arrival_cbra))
         self._total_arrivals_pbra += float(np.sum(arrival_pbra))
@@ -480,6 +479,7 @@ class MACSimulator:
             pbra_demand = 0.0
             cfra_density_weighted = 0.0
             for comp_start, comp_end in components:
+                # print('comp_start, comp_end', comp_start, comp_end)
                 for seg_start, seg_end, segment in self._segments:
                     overlap = _interval_overlap(comp_start, comp_end, seg_start, seg_end)
                     if overlap <= 0.0:
@@ -491,15 +491,17 @@ class MACSimulator:
                     cfra_density_weighted += overlap * profile.cfra_density
                     region_idx = self._region_index[profile.name]
                     region_lengths[region_idx] += overlap
-            total_length = float(np.sum(region_lengths))
-            if total_length > 0.0:
-                average_cfra_density = cfra_density_weighted / total_length
-            else:
-                average_cfra_density = 0.0
+            # total_length = float(np.sum(region_lengths))
+            # print('total_length', total_length, cfra_density_weighted)
+            # if total_length > 0.0:
+            #     average_cfra_density = cfra_density_weighted / total_length
+            # else:
+            #     average_cfra_density = 0.0
             cbra_arrivals[slot_idx] = int(max(0, math.ceil(cbra_demand)))
             pbra_arrivals[slot_idx] = int(max(0, math.ceil(pbra_demand)))
-            new_length = self._new_coverage_length(components)
-            cfra_arrivals[slot_idx] = int(max(0, math.ceil(new_length * average_cfra_density)))
+            # new_length = self._new_coverage_length(components)
+            cfra_arrivals[slot_idx] = cfra_density_weighted
+            # print('cal cfra',int(max(0, math.ceil(new_length * average_cfra_density))), average_cfra_density, new_length, new_length * average_cfra_density)
             self._prev_components = components
             self._advance_coverage()
 
@@ -761,27 +763,27 @@ def _interval_overlap(a_start: float, a_end: float, b_start: float, b_end: float
 def default_simulator_config() -> MACSimulatorConfig:
     regions = (
         RegionTrafficProfile(name="suburban",
-                             cbra_density=3.0 * 0.2,
-                             pbra_density=3.0 * 0.7,
-                             cfra_density=3.0 * 0.1),
+                             cbra_density=5.0 * 0.2,
+                             pbra_density=5.0 * 0.7,
+                             cfra_density=5.0 * 0.1),
         RegionTrafficProfile(name="periurbanType1",
-                             cbra_density=4.0 * 0.2,
-                             pbra_density=4.0 * 0.3,
-                             cfra_density=4.0 * 0.5),
+                             cbra_density=10.0 * 0.2,
+                             pbra_density=10.0 * 0.2,
+                             cfra_density=10.0 * 0.6),
         RegionTrafficProfile(name="periurbanType2",
-                             cbra_density=4.0 * 0.2,
-                             pbra_density=4.0 * 0.7,
-                             cfra_density=4.0 * 0.1),
+                             cbra_density=10.0 * 0.2,
+                             pbra_density=10.0 * 0.7,
+                             cfra_density=10.0 * 0.1),
         RegionTrafficProfile(name="urban",
-                             cbra_density=100.0 * 0.75,
-                             pbra_density=100.0 * 0.1,
-                             cfra_density=100.0 * 0.15),
+                             cbra_density=80.0 * 0.7,
+                             pbra_density=80.0 * 0.2,
+                             cfra_density=80.0 * 0.1),
     )
     pattern: Sequence[Tuple[str, float]] = (
         ("suburban", 2.0),
-        ("periurbanType1", 1.0),
+        ("periurbanType1", 2.5),
         ("urban", 5.0),
-        ("periurbanType2", 1.0),
+        ("periurbanType2", 1.5),
         ("suburban", 2.0),
     )
     segments: List[RegionSegment] = []
