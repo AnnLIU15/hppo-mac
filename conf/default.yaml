@@ -14,7 +14,7 @@ environment:
   # 如需修改，需要同步更新 mac_simulator.py 中的 HISTORY_DIM
   history_size: 10
   total_preambles: 64
-  base_preamble_split: [ 24, 24, 16 ]
+  base_preamble_split: [ 27, 27, 10 ]
   mac_config: default
 
 algorithm:

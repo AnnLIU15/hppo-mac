@@ -53,9 +53,9 @@ class HeuristicConfig:
     backlog_medium: float = 60.0
     load_high: float = 100.0
     load_medium: float = 50.0
-    acb_levels: Tuple[float, float, float] = (0.35, 0.5, 0.65)
-    low_collision_acb: float = 0.75
-    tremble_prob: float = 0.05
+    acb_levels: Tuple[float, float, float] = (0.05, 0.15, 0.5)
+    low_collision_acb: float = 0.8
+    tremble_prob: float = 0.0
 
 
 @dataclass
@@ -155,7 +155,7 @@ def run_episode(
     traces: List[StepTrace] = []
     heuristic_cfg = HeuristicConfig()
     done = False
-    env.simulator.configure_access_state(cbra=31,cfra=2,pbra=31)
+    env.simulator.configure_access_state(cbra=27,cfra=10,pbra=27)
     while not done:
         if not fix:
             decision = heuristic_policy(observation, delta_range, rng, heuristic_cfg)

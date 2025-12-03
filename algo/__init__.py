@@ -1,6 +1,7 @@
 """算法模块，包含 PPO 训练逻辑等实现。"""
 
 from .hppo import HPPOConfig, build_hppo_modules, train_hppo
+from .evaluate import evaluate_agent
 from .logger import get_logger, setup_logger
 
 __all__ = [
@@ -9,4 +10,5 @@ __all__ = [
 	"HPPOConfig",
 	"build_hppo_modules",
 	"train_hppo",
+	"evaluate_agent",
 ]

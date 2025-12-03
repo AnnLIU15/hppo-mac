@@ -571,8 +571,15 @@ def train_hppo(
     config: HPPOConfig,
     *,
     logger_fn: Optional[callable] = None,
-) -> Dict[str, float]:
-    """Runs a TorchRL PPO loop tailored for the Satellite MAC environment."""
+) -> tuple[Dict[str, float], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Runs a TorchRL PPO loop tailored for the Satellite MAC environment.
+
+    Returns:
+        tuple containing:
+        - metrics: Dictionary of final training metrics
+        - best_model_state: State dict of the best performing model (detached and copied)
+        - last_model_state: State dict of the final model (detached and copied)
+    """
 
     device = config.device or torch.device("cpu")
     actor.to(device)
@@ -601,6 +608,10 @@ def train_hppo(
 
     metrics: Dict[str, float] = {}
 
+    # 追踪最佳模型
+    best_reward: float = float('-inf')
+    best_model_state: Optional[Dict[str, torch.Tensor]] = None
+    all_episode = len(collector)
     for iteration, batch in enumerate(collector):
         if iteration >= config.max_iterations:
             break
@@ -697,49 +708,24 @@ def train_hppo(
                 }
                 metrics = {**metrics, **preamble_means}
 
-        info_td: Optional[TensorDictBase]
-        try:
-            info_td = batch.get(("next", "info"))
-        except KeyError:
-            info_td = None
-        if isinstance(info_td, TensorDictBase):
-            success_parts = []
-            collision_parts = []
-            for key in ("success_cbra", "success_pbra", "success_cfra"):
-                value = info_td.get(key, None)
-                if isinstance(value, torch.Tensor):
-                    success_parts.append(value.to(dtype=torch.float32))
-            for key in ("collision_cbra", "collision_pbra", "collision_cfra"):
-                value = info_td.get(key, None)
-                if isinstance(value, torch.Tensor):
-                    collision_parts.append(value.to(dtype=torch.float32))
-            if success_parts and collision_parts:
-                success_tensor = torch.stack(success_parts, dim=0).sum(dim=0)
-                collision_tensor = torch.stack(collision_parts, dim=0).sum(dim=0)
-                success_vals = success_tensor.reshape(-1)
-                collision_vals = collision_tensor.reshape(-1)
-                success_mean = float(success_vals.mean().detach().cpu().item())
-                collision_mean = float(collision_vals.mean().detach().cpu().item())
-                denom = success_mean + collision_mean
-                if denom > 0.0:
-                    success_rate = success_mean / denom
-                    collision_rate = collision_mean / denom
-                else:
-                    success_rate = 0.0
-                    collision_rate = 0.0
-                metrics = {
-                    **metrics,
-                    "succ_total": success_mean,
-                    "coll_total": collision_mean,
-                    "succ_rate": success_rate,
-                    "coll_rate": collision_rate,
-                }
+        # 获取当前迭代的平均奖励
+        current_reward = float(batch["next", "reward"].mean().cpu().item())
 
+        # 更新最佳模型（如果当前奖励更好）
+        if (current_reward > best_reward) and (iteration > all_episode//2):
+            best_reward = current_reward
+            # 深拷贝并detach actor和critic的state_dict
+            best_model_state = {
+                'actor': {k: v.detach().clone().cpu() for k, v in actor.state_dict().items()},
+                'critic': {k: v.detach().clone().cpu() for k, v in critic.state_dict().items()},
+                'iteration': iteration,
+                'reward': current_reward,
+            }
 
         if logger_fn:
             log_payload = {
                 "iteration": iteration,
-                "reward": float(batch["next", "reward"].mean().cpu().item()),
+                "reward": current_reward,
                 **metrics,
             }
             if success_rate is not None and "success_rate" not in log_payload:
@@ -760,4 +746,17 @@ def train_hppo(
             logger_fn(**log_payload)
 
     collector.shutdown()
-    return metrics
+
+    # 保存最后一轮模型的state_dict（深拷贝并detach）
+    last_model_state = {
+        'actor': {k: v.detach().clone().cpu() for k, v in actor.state_dict().items()},
+        'critic': {k: v.detach().clone().cpu() for k, v in critic.state_dict().items()},
+        'iteration': iteration,
+        'reward': current_reward if 'current_reward' in locals() else float('nan'),
+    }
+
+    # 如果没有找到更好的模型（比如只运行了0次迭代），使用最后的模型作为最佳模型
+    if best_model_state is None:
+        best_model_state = last_model_state
+
+    return metrics, best_model_state, last_model_state

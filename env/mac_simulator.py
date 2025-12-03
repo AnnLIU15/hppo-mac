@@ -104,7 +104,7 @@ class MACSimulatorConfig:
     regions: Tuple[RegionTrafficProfile, ...]
     segments: Tuple[RegionSegment, ...]
     total_preambles: int = DEFAULT_TOTAL_PREAMBLES
-    base_preamble_split: Tuple[int, int, int] = (24, 24, 16)
+    base_preamble_split: Tuple[int, int, int] = (27, 27, 10)
     history_size: int = DEFAULT_HISTORY_SIZE
     coverage_window: float = 3.0
     motion_per_step: float = 0.1
@@ -183,6 +183,10 @@ class MACSimulator:
         self._collision_total = 0.0
         self._success_breakdown = np.zeros((MAC_PROTOCOL_COUNT,), dtype=np.float32)
         self._collision_breakdown = np.zeros((MAC_PROTOCOL_COUNT,), dtype=np.float32)
+        # Episode级别的累计统计 (总到达数和总成功数)
+        self._total_arrivals_cbra = 0.0
+        self._total_arrivals_pbra = 0.0
+        self._total_arrivals_cfra = 0.0
         self._last_requests_cbra = 0.0
         self._last_requests_pbra = 0.0
         self._last_collision_ratio_cbra = 0.0
@@ -231,6 +235,10 @@ class MACSimulator:
         self._collision_total = 0.0
         self._success_breakdown.fill(0.0)
         self._collision_breakdown.fill(0.0)
+        # 重置episode级别的累计统计
+        self._total_arrivals_cbra = 0.0
+        self._total_arrivals_pbra = 0.0
+        self._total_arrivals_cfra = 0.0
         self._slot_counter = 0
         self._current_acb = 1.0
         self._reset_coverage_position()
@@ -251,6 +259,12 @@ class MACSimulator:
         if num_slots <= 0:
             raise ValueError("num_slots must be positive")
         arrival_cbra, arrival_pbra, arrival_cfra = self._forecast_arrivals(num_slots)
+
+        # 累加本次step的arrivals到episode总计
+        self._total_arrivals_cbra += float(np.sum(arrival_cbra))
+        self._total_arrivals_pbra += float(np.sum(arrival_pbra))
+        self._total_arrivals_cfra += float(np.sum(arrival_cfra))
+
         delta_cbra = int(params.get("M_CBRA", 0))
         delta_pbra = int(params.get("M_PBRA", 0))
         self._current_acb = float(np.clip(params.get("q_ACB", 1.0), 0.0, 1.0))
@@ -258,7 +272,6 @@ class MACSimulator:
         assert (
             int(np.sum(self._preamble_allocation)) == int(self.config.total_preambles)
         ), "Invalid preamble allocation after applying deltas"
-        print(f'self._preamble_allocation, {self._preamble_allocation}')
         total_success_cbra = 0.0
         total_success_pbra = 0.0
         total_collision_cbra = 0.0
@@ -289,20 +302,76 @@ class MACSimulator:
         success_cfra = min(total_cfra_attempts, available_cfra)
         collision_cfra = max(total_cfra_attempts - success_cfra, 0.0)
 
-        throughput_total = total_success_cbra + total_success_pbra
-        collision_total = total_collision_cbra + total_collision_pbra
-        total_demand = max(
-            1e-10,
-            total_admitted_cbra + total_admitted_pbra,
-        )
-        # 防止除零错误
-        cfra_penalty = 10 * collision_cfra / max(total_cfra_attempts, 1e-10)
-        reward_total = (throughput_total) / total_demand - cfra_penalty
-        # (
-        #      * self.config.reward_weights["throughput"]
-        #     # + collision_total * self.config.reward_weights["collision"]
-        # ) / total_demand
-        # reward_total = reward_avg * float(num_slots)
+        # ============ 改进的Reward设计 v2.2 (优化权重与归一化) ============
+        # 关键改进:
+        # 1. 降低碰撞惩罚权重 (1.0 -> 0.5): 允许理论最优工作点的碰撞率
+        # 2. CBRA和PBRA等权重 (均为1.0): 让Agent自然学习
+        # 3. Log归一化Backlog: 适应数量级变化
+
+        # 1. 分别计算CBRA和PBRA的资源容量
+        preambles_cbra = int(self._preamble_allocation[0])
+        preambles_pbra = int(self._preamble_allocation[1])
+        capacity_cbra = float(num_slots * preambles_cbra)
+        capacity_pbra = float(num_slots * preambles_pbra)
+
+        # 2. 分别计算资源利用效率 (归一化到[0,1])
+        # 理论上限约为 1/e ≈ 0.37 (Slotted ALOHA)
+        # 乘以 e ≈ 2.718 使得最优表现接近 1.0
+        if capacity_cbra > 0:
+            efficiency_cbra = (total_success_cbra / capacity_cbra) * 2.718
+        else:
+            efficiency_cbra = 0.0
+
+        if capacity_pbra > 0:
+            efficiency_pbra = (total_success_pbra / capacity_pbra) * 2.718
+        else:
+            efficiency_pbra = 0.0
+
+        # 3. 吞吐量奖励 (不加权重，让Agent自然学习)
+        # CBRA和PBRA使用相同权重，让网络自主发现最优策略
+        w_cbra, w_pbra = 1.0, 1.0
+        throughput_reward = min(efficiency_cbra, efficiency_pbra)
+
+        # 4. 分别计算碰撞率 (保持v2.1的优秀逻辑: 堵住ACB=0的漏洞)
+        if total_admitted_cbra > 0:
+            collision_rate_cbra = total_collision_cbra / total_admitted_cbra
+        else:
+            avg_queue_cbra = total_cbra_pool / float(num_slots)
+            collision_rate_cbra = 1.0 if avg_queue_cbra > 1.0 else 0.0
+
+        if total_admitted_pbra > 0:
+            collision_rate_pbra = total_collision_pbra / total_admitted_pbra
+        else:
+            avg_queue_pbra = total_pbra_pool / float(num_slots)
+            collision_rate_pbra = 1.0 if avg_queue_pbra > 1.0 else 0.0
+
+        # 5. 碰撞惩罚 (修正: 降低权重!)
+        # 理由: 在最优吞吐(Eff=1.0)时，碰撞率必然约为0.63
+        # 如果系数是1.0，Net Gain = 1.0 - 0.63 = 0.37
+        # 如果Agent保守(Eff=0.5, Coll=0.1)，Net Gain = 0.5 - 0.1 = 0.4
+        # 结论: 系数过高会导致Agent保守。降至0.5后:
+        # 最优: 1.0 - 0.5*0.63 = 0.685 > 保守: 0.5 - 0.5*0.1 = 0.45
+        collision_penalty = 0.25 * max(collision_rate_cbra, collision_rate_pbra)
+
+        # 6. CFRA资源不足惩罚 (保持不变，硬约束)
+        # CFRA是已连接终端，资源不满足会导致服务中断
+        cfra_penalty = 0.0
+        if total_cfra_attempts > 0:
+            cfra_shortage_rate = collision_cfra / total_cfra_attempts  # 资源不足率
+            cfra_penalty = 5.0 * cfra_shortage_rate  # 5倍权重,强制保障CFRA资源充足
+
+        # 7. 队列积压惩罚 (优化: 使用Log缩放，避免Magic Number 1000失效)
+        # 使用log10可以处理从10到10000的大幅度波动
+        # backlog=10 -> pen=0.1; backlog=100 -> pen=0.2; backlog=1000 -> pen=0.3
+        # 相比线性除法，这能更平滑地处理爆发式流量（如卫星覆盖区切换）
+        avg_backlog = (total_cbra_pool + total_pbra_pool) / float(num_slots)
+        backlog_penalty = 0.1 * float(np.log10(avg_backlog + 1.0))
+
+        # 综合reward
+        # v2.2关键改进: 碰撞权重0.5 (鼓励探索容量边界) + 等权重策略 (让Agent自然学习)
+        reward_total = throughput_reward - collision_penalty - cfra_penalty - backlog_penalty        # 用于统计的总吞吐量和总碰撞 (包含CFRA)
+        throughput_total = total_success_cbra + total_success_pbra + success_cfra
+        collision_total = total_collision_cbra + total_collision_pbra + collision_cfra
 
         avg_requests_cbra = total_admitted_cbra / float(num_slots)
         avg_requests_pbra = total_admitted_pbra / float(num_slots)
@@ -583,7 +652,7 @@ class MACSimulator:
             released += float(queue[0])
             queue[:-1] = queue[1:]
             queue[-1] = 0.0
-        return released
+        return released * 0.8 # 20% retention factor
 
     def _update_history(self, stats: np.ndarray) -> None:
         self._history_buffer[self._history_index] = stats
@@ -660,6 +729,13 @@ class MACSimulator:
             "collision_cbra": np.array([aggregates["collision_cbra"]], dtype=np.float32),
             "collision_pbra": np.array([aggregates["collision_pbra"]], dtype=np.float32),
             "collision_cfra": np.array([aggregates["collision_cfra"]], dtype=np.float32),
+            # Episode级别的累计统计
+            "total_arrivals_cbra": np.array([self._total_arrivals_cbra], dtype=np.float32),
+            "total_arrivals_pbra": np.array([self._total_arrivals_pbra], dtype=np.float32),
+            "total_arrivals_cfra": np.array([self._total_arrivals_cfra], dtype=np.float32),
+            "total_success_cbra": np.array([self._success_breakdown[0]], dtype=np.float32),
+            "total_success_pbra": np.array([self._success_breakdown[1]], dtype=np.float32),
+            "total_success_cfra": np.array([self._success_breakdown[2]], dtype=np.float32),
             "pending_backoff_cbra": np.array([float(np.sum(self._backoff_queue_cbra))], dtype=np.float32),
             "pending_backoff_pbra": np.array([float(np.sum(self._backoff_queue_pbra))], dtype=np.float32),
             "collision_ratio_cbra": np.array([self._last_collision_ratio_cbra], dtype=np.float32),
@@ -686,22 +762,26 @@ def default_simulator_config() -> MACSimulatorConfig:
     regions = (
         RegionTrafficProfile(name="suburban",
                              cbra_density=3.0 * 0.2,
-                             pbra_density=3.0 * 0.75,
-                             cfra_density=3.0 * 0.05),
-        RegionTrafficProfile(name="periurban",
+                             pbra_density=3.0 * 0.7,
+                             cfra_density=3.0 * 0.1),
+        RegionTrafficProfile(name="periurbanType1",
                              cbra_density=4.0 * 0.2,
-                             pbra_density=4.0 * 0.75,
-                             cfra_density=4.0 * 0.05),
+                             pbra_density=4.0 * 0.3,
+                             cfra_density=4.0 * 0.5),
+        RegionTrafficProfile(name="periurbanType2",
+                             cbra_density=4.0 * 0.2,
+                             pbra_density=4.0 * 0.7,
+                             cfra_density=4.0 * 0.1),
         RegionTrafficProfile(name="urban",
-                             cbra_density=100.0 * 0.85,
+                             cbra_density=100.0 * 0.75,
                              pbra_density=100.0 * 0.1,
-                             cfra_density=100.0 * 0.05),
+                             cfra_density=100.0 * 0.15),
     )
     pattern: Sequence[Tuple[str, float]] = (
         ("suburban", 2.0),
-        ("periurban", 1.0),
+        ("periurbanType1", 1.0),
         ("urban", 5.0),
-        ("periurban", 1.0),
+        ("periurbanType2", 1.0),
         ("suburban", 2.0),
     )
     segments: List[RegionSegment] = []

@@ -117,8 +117,8 @@ class SatelliteMACEnv(gym.Env):
         observation = self.simulator.initialize_state(seed)
         observation = self._format_observation(observation)
         info = {
-            "step": self._step_count,
-            "action_valid": 1.0,
+            "step": np.array(self._step_count, dtype=np.float32),
+            "action_valid": np.array(1.0, dtype=np.float32),
         }
         return observation, info
 
@@ -157,15 +157,18 @@ class SatelliteMACEnv(gym.Env):
         observation = self._format_observation(next_state)
 
         info = {
-            "step": self._step_count,
-            "action_valid": 1.0,
+            "step": np.array(self._step_count, dtype=np.float32),
+            "action_valid": np.array(1.0, dtype=np.float32),
         }
         for key, value in sim_info.items():
-            if isinstance(value, (float, int, str)):
-                info[key] = value
+            if isinstance(value, (float, int)):
+                info[key] = np.array(value, dtype=np.float32)
+            elif isinstance(value, str):
+                # 字符串类型跳过，TorchRL不支持
+                continue
             elif isinstance(value, np.ndarray):
                 if value.size == 1:
-                    info[key] = float(value.item())
+                    info[key] = np.array(float(value.item()), dtype=np.float32)
                 else:
                     info[key] = value.astype(np.float32)
 
