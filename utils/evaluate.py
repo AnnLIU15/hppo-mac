@@ -116,6 +116,7 @@ def evaluate_trained_agent(actor, rl_env, num_episodes=20, seed_offset=0, seed=N
     all_success_pbra = []
     all_success_cfra = []
     all_episode_lengths = []
+    all_theoretical_optimal = []
 
     for episode_idx in range(num_episodes):
         if seed is not None:
@@ -169,6 +170,7 @@ def evaluate_trained_agent(actor, rl_env, num_episodes=20, seed_offset=0, seed=N
         all_success_cbra.append(extract_scalar(td_next, "total_success_cbra", 0))
         all_success_pbra.append(extract_scalar(td_next, "total_success_pbra", 0))
         all_success_cfra.append(extract_scalar(td_next, "total_success_cfra", 0))
+        all_theoretical_optimal.append(extract_scalar(td_next, "total_theoretical_optimal", 0))
 
     # 计算统计结果
     results = {
@@ -181,6 +183,7 @@ def evaluate_trained_agent(actor, rl_env, num_episodes=20, seed_offset=0, seed=N
         "eval_success_cbra": float(np.mean(all_success_cbra)),
         "eval_success_pbra": float(np.mean(all_success_pbra)),
         "eval_success_cfra": float(np.mean(all_success_cfra)),
+        "eval_theoretical_optimal": float(np.mean(all_theoretical_optimal)),
     }
 
     # 计算成功率
@@ -252,6 +255,7 @@ def run_baseline_comparison(
             success_cbra = float(_scalar(last_info, "total_success_cbra", 0.0))
             success_pbra = float(_scalar(last_info, "total_success_pbra", 0.0))
             success_cfra = float(_scalar(last_info, "total_success_cfra", 0.0))
+            theoretical_optimal = float(_scalar(last_info, "total_theoretical_optimal", 0.0))
 
             strategy_records.append({
                 "reward": stats.reward / max(stats.steps, 1),
@@ -261,6 +265,7 @@ def run_baseline_comparison(
                 "success_cbra": success_cbra,
                 "success_pbra": success_pbra,
                 "success_cfra": success_cfra,
+                "theoretical_optimal": theoretical_optimal,
             })
 
         # 计算平均值
@@ -272,6 +277,7 @@ def run_baseline_comparison(
             "success_cbra": np.mean([r["success_cbra"] for r in strategy_records]),
             "success_pbra": np.mean([r["success_pbra"] for r in strategy_records]),
             "success_cfra": np.mean([r["success_cfra"] for r in strategy_records]),
+            "theoretical_optimal": np.mean([r["theoretical_optimal"] for r in strategy_records]),
         }
 
         # 计算成功率

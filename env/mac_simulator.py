@@ -187,6 +187,7 @@ class MACSimulator:
         self._total_arrivals_cbra = 0.0
         self._total_arrivals_pbra = 0.0
         self._total_arrivals_cfra = 0.0
+        self._total_theoretical_optimal = 0.0  # 累计理论最优接入数
         self._last_requests_cbra = 0.0
         self._last_requests_pbra = 0.0
         self._last_collision_ratio_cbra = 0.0
@@ -239,6 +240,7 @@ class MACSimulator:
         self._total_arrivals_cbra = 0.0
         self._total_arrivals_pbra = 0.0
         self._total_arrivals_cfra = 0.0
+        self._total_theoretical_optimal = 0.0  # 重置理论最优累计值
         self._slot_counter = 0
         self._current_acb = 1.0
         self._reset_coverage_position()
@@ -263,6 +265,13 @@ class MACSimulator:
         self._total_arrivals_cbra += float(np.sum(arrival_cbra))
         self._total_arrivals_pbra += float(np.sum(arrival_pbra))
         self._total_arrivals_cfra += float(np.sum(arrival_cfra))
+
+        # 计算本次step的理论最优值并累加
+        # 每个slot最多能传输 64 个包（64个前导码，每个前导码1个包）
+        theoretical_max_per_slot = DEFAULT_TOTAL_PREAMBLES
+        step_total_arrivals = float(np.sum(arrival_cbra)) + float(np.sum(arrival_pbra)) + float(np.sum(arrival_cfra))
+        step_theoretical_optimal = min(num_slots * theoretical_max_per_slot, step_total_arrivals)
+        self._total_theoretical_optimal += step_theoretical_optimal
 
         delta_cbra = int(params.get("M_CBRA", 0))
         delta_pbra = int(params.get("M_PBRA", 0))
@@ -738,6 +747,7 @@ class MACSimulator:
             "total_success_cbra": np.array([self._success_breakdown[0]], dtype=np.float32),
             "total_success_pbra": np.array([self._success_breakdown[1]], dtype=np.float32),
             "total_success_cfra": np.array([self._success_breakdown[2]], dtype=np.float32),
+            "total_theoretical_optimal": np.array([self._total_theoretical_optimal], dtype=np.float32),
             "pending_backoff_cbra": np.array([float(np.sum(self._backoff_queue_cbra))], dtype=np.float32),
             "pending_backoff_pbra": np.array([float(np.sum(self._backoff_queue_pbra))], dtype=np.float32),
             "collision_ratio_cbra": np.array([self._last_collision_ratio_cbra], dtype=np.float32),
@@ -767,13 +777,13 @@ def default_simulator_config() -> MACSimulatorConfig:
                              pbra_density=5.0 * 0.7,
                              cfra_density=5.0 * 0.1),
         RegionTrafficProfile(name="periurbanType1",
-                             cbra_density=10.0 * 0.2,
-                             pbra_density=10.0 * 0.2,
-                             cfra_density=10.0 * 0.6),
+                             cbra_density=15.0 * 0.2,
+                             pbra_density=15.0 * 0.2,
+                             cfra_density=15.0 * 0.6),
         RegionTrafficProfile(name="periurbanType2",
-                             cbra_density=10.0 * 0.2,
-                             pbra_density=10.0 * 0.7,
-                             cfra_density=10.0 * 0.1),
+                             cbra_density=15.0 * 0.2,
+                             pbra_density=15.0 * 0.7,
+                             cfra_density=15.0 * 0.1),
         RegionTrafficProfile(name="urban",
                              cbra_density=80.0 * 0.7,
                              pbra_density=80.0 * 0.2,
