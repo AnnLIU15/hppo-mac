@@ -40,7 +40,7 @@ def static_sensitivity_config(
     cbra_ratio: float,
     pbra_ratio: float,
     cfra_ratio: float,
-    duration: float = 11.0
+    duration: float = 13.0
 ) -> MACSimulatorConfig:
     """创建静态场景的模拟器配置
 

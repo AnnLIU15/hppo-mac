@@ -147,6 +147,7 @@ def run_episode(
     seed: int,
     fix: bool = False,
     fix_acb: float = 0.5,
+    preamble_init: tuple = (40, 14, 10)
 ) -> Tuple[EpisodeStats, Dict[str, object], List[StepTrace]]:
     observation, info = env.reset(seed=seed)
     validate_info(info)
@@ -155,8 +156,15 @@ def run_episode(
     traces: List[StepTrace] = []
     heuristic_cfg = HeuristicConfig()
     done = False
-    env.simulator.configure_access_state(cbra=27,cfra=10,pbra=27)
+    env.simulator.configure_access_state(cbra=preamble_init[0],
+                                         pbra=preamble_init[1],
+                                         cfra=preamble_init[2],)
+    num_slots_per_step = env.unwrapped.config.num_slots_per_step
+    last_cfra_total_arrivals_cfra = 0
     while not done:
+        cur_cfra_total_arrivals_cfra = env.unwrapped.simulator._total_arrivals_cfra
+        last_arrial_cfra = cur_cfra_total_arrivals_cfra - last_cfra_total_arrivals_cfra
+        last_cfra_total_arrivals_cfra = cur_cfra_total_arrivals_cfra
         if not fix:
             decision = heuristic_policy(observation, delta_range, rng, heuristic_cfg)
         else:
