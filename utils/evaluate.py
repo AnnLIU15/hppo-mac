@@ -292,7 +292,7 @@ def run_baseline_comparison(
     return baseline_results
 
 
-def train_and_evaluate_scenario(
+def train_scenario(
     scenario_name: str,
     sim_config: MACSimulatorConfig,
     env_config: SatelliteMACEnvConfig,
@@ -300,14 +300,12 @@ def train_and_evaluate_scenario(
     build_env_func,
     build_modules_func,
     train_func,
-    run_episode_func,
     logger,
     num_envs: int = 8,
     env_backend: str = "parallel",
-    num_episodes: int = 20,
     seed: int = None
 ) -> Dict:
-    """训练和评估单个场景
+    """训练单个场景（不包含评估）
 
     Args:
         scenario_name: 场景名称
@@ -317,15 +315,13 @@ def train_and_evaluate_scenario(
         build_env_func: 构建环境的函数
         build_modules_func: 构建actor/critic的函数
         train_func: 训练函数
-        run_episode_func: 运行episode的函数（用于基线对比）
         logger: 日志记录器
         num_envs: 并行环境数量
         env_backend: 环境后端类型
-        num_episodes: 评估的episode数量
         seed: 随机种子
 
     Returns:
-        包含所有结果的字典
+        包含训练结果的字典（环境、模型等）
     """
     from torchrl.envs import ParallelEnv, SerialEnv, TransformedEnv
     from torchrl.envs.transforms import Compose, DoubleToFloat
@@ -401,55 +397,210 @@ def train_and_evaluate_scenario(
 
     print(f"训练完成: 最佳奖励={scenario_best_model['reward']:.4f} (迭代{scenario_best_model['iteration']})")
 
-    # 5. 评估最佳模型 - 使用深拷贝避免修改原始模型
+    # 返回训练结果，包含环境、模型等
+    return {
+        'scenario_name': scenario_name,
+        'env_config': deepcopy(scenario_env_config),
+        'sim_config': deepcopy(sim_config),
+        'rl_env': scenario_rl_env,
+        'actor': scenario_actor,
+        'critic': scenario_critic,
+        'best_model': deepcopy(scenario_best_model),
+        'last_model': deepcopy(scenario_last_model),
+        'metrics_history': scenario_metrics_history,
+    }
+
+
+def evaluate_scenario_ppo(
+    scenario_name: str,
+    scenario_env_config: SatelliteMACEnvConfig,
+    actor,
+    critic,
+    rl_env,
+    best_model: Dict,
+    last_model: Dict,
+    num_episodes: int = 20,
+    seed: int = None
+) -> Dict:
+    """评估PPO模型（最佳和最后一轮）
+
+    Args:
+        scenario_name: 场景名称
+        scenario_env_config: 环境配置
+        actor: actor网络
+        critic: critic网络
+        rl_env: TorchRL环境
+        best_model: 最佳模型的state dict
+        last_model: 最后一轮模型的state dict
+        num_episodes: 评估的episode数量
+        seed: 随机种子
+
+    Returns:
+        包含评估结果的字典
+    """
+    print(f"\n评估场景 {scenario_name} 的PPO模型...")
+
+    # 评估最佳模型
     print("  评估最佳模型...")
-    scenario_actor.load_state_dict(deepcopy(scenario_best_model['actor']))
-    scenario_critic.load_state_dict(deepcopy(scenario_best_model['critic']))
+    actor.load_state_dict(deepcopy(best_model['actor']))
+    critic.load_state_dict(deepcopy(best_model['critic']))
 
     eval_results_best = evaluate_trained_agent(
-        actor=scenario_actor,
-        rl_env=scenario_rl_env,
+        actor=actor,
+        rl_env=rl_env,
         num_episodes=num_episodes,
         seed=seed
     )
 
-    # 5b. 评估最后一轮模型
+    # 评估最后一轮模型
     print("  评估最后一轮模型...")
-    scenario_actor.load_state_dict(deepcopy(scenario_last_model['actor']))
-    scenario_critic.load_state_dict(deepcopy(scenario_last_model['critic']))
+    actor.load_state_dict(deepcopy(last_model['actor']))
+    critic.load_state_dict(deepcopy(last_model['critic']))
 
     eval_results_last = evaluate_trained_agent(
-        actor=scenario_actor,
-        rl_env=scenario_rl_env,
+        actor=actor,
+        rl_env=rl_env,
         num_episodes=num_episodes,
         seed=seed
     )
 
-    # 6. 运行基线对比
+    print(f"  PPO最佳奖励: {eval_results_best['eval_reward_mean']:.4f}")
+    print(f"  PPO最后奖励: {eval_results_last['eval_reward_mean']:.4f}")
+
+    return {
+        'eval_results_best': deepcopy(eval_results_best),
+        'eval_results_last': deepcopy(eval_results_last),
+    }
+
+
+def evaluate_scenario_baseline(
+    scenario_name: str,
+    scenario_env_config: SatelliteMACEnvConfig,
+    run_episode_func,
+    num_episodes: int = 20,
+    seed: int = None,
+    fix_acb: float = 0.2
+) -> Dict:
+    """评估baseline策略（固定分配和启发式）
+
+    Args:
+        scenario_name: 场景名称
+        scenario_env_config: 环境配置
+        run_episode_func: 运行episode的函数（从baseline模块导入）
+        num_episodes: 评估的episode数量
+        seed: 随机种子
+        fix_acb: 固定分配时的ACB比例
+
+    Returns:
+        包含baseline评估结果的字典
+    """
+    print(f"\n评估场景 {scenario_name} 的Baseline策略...")
+
     baseline_results = run_baseline_comparison(
         scenario_env_config=scenario_env_config,
+        run_episode_func=run_episode_func,
+        num_episodes=num_episodes,
+        seed=seed,
+        fix_acb=fix_acb
+    )
+
+    print(f"  固定分配奖励: {baseline_results['固定分配']['reward']:.4f}")
+    print(f"  启发式算法奖励: {baseline_results['启发式算法']['reward']:.4f}")
+
+    return {
+        'baseline_results': deepcopy(baseline_results),
+    }
+
+
+def train_and_evaluate_scenario(
+    scenario_name: str,
+    sim_config: MACSimulatorConfig,
+    env_config: SatelliteMACEnvConfig,
+    train_config,
+    build_env_func,
+    build_modules_func,
+    train_func,
+    run_episode_func,
+    logger,
+    num_envs: int = 8,
+    env_backend: str = "parallel",
+    num_episodes: int = 20,
+    seed: int = None
+) -> Dict:
+    """训练和评估单个场景（完整流程）
+
+    Args:
+        scenario_name: 场景名称
+        sim_config: 模拟器配置
+        env_config: 环境配置
+        train_config: 训练配置
+        build_env_func: 构建环境的函数
+        build_modules_func: 构建actor/critic的函数
+        train_func: 训练函数
+        run_episode_func: 运行episode的函数（用于基线对比）
+        logger: 日志记录器
+        num_envs: 并行环境数量
+        env_backend: 环境后端类型
+        num_episodes: 评估的episode数量
+        seed: 随机种子
+
+    Returns:
+        包含所有结果的字典
+    """
+    # 1. 训练
+    train_result = train_scenario(
+        scenario_name=scenario_name,
+        sim_config=sim_config,
+        env_config=env_config,
+        train_config=train_config,
+        build_env_func=build_env_func,
+        build_modules_func=build_modules_func,
+        train_func=train_func,
+        logger=logger,
+        num_envs=num_envs,
+        env_backend=env_backend,
+        seed=seed
+    )
+
+    # 2. 评估PPO
+    ppo_eval_result = evaluate_scenario_ppo(
+        scenario_name=scenario_name,
+        scenario_env_config=train_result['env_config'],
+        actor=train_result['actor'],
+        critic=train_result['critic'],
+        rl_env=train_result['rl_env'],
+        best_model=train_result['best_model'],
+        last_model=train_result['last_model'],
+        num_episodes=num_episodes,
+        seed=seed
+    )
+
+    # 3. 评估Baseline
+    baseline_eval_result = evaluate_scenario_baseline(
+        scenario_name=scenario_name,
+        scenario_env_config=train_result['env_config'],
         run_episode_func=run_episode_func,
         num_episodes=num_episodes,
         seed=seed
     )
 
-    # 7. 保存所有结果 - 使用深拷贝确保数据独立
+    # 4. 合并所有结果
     scenario_result = {
         'scenario_name': scenario_name,
-        'env_config': deepcopy(scenario_env_config),
-        'sim_config': deepcopy(sim_config),
-        'best_model': deepcopy(scenario_best_model),
-        'last_model': deepcopy(scenario_last_model),
-        'eval_results_best': deepcopy(eval_results_best),
-        'eval_results_last': deepcopy(eval_results_last),
-        'baseline_results': deepcopy(baseline_results),
+        'env_config': train_result['env_config'],
+        'sim_config': train_result['sim_config'],
+        'best_model': train_result['best_model'],
+        'last_model': train_result['last_model'],
+        'eval_results_best': ppo_eval_result['eval_results_best'],
+        'eval_results_last': ppo_eval_result['eval_results_last'],
+        'baseline_results': baseline_eval_result['baseline_results'],
     }
 
-    print(f"场景 {scenario_name} 完成!")
-    print(f"  PPO最佳奖励: {eval_results_best['eval_reward_mean']:.4f}")
-    print(f"  PPO最后奖励: {eval_results_last['eval_reward_mean']:.4f}")
-    print(f"  固定分配奖励: {baseline_results['固定分配']['reward']:.4f}")
-    print(f"  启发式算法奖励: {baseline_results['启发式算法']['reward']:.4f}")
+    print(f"\n场景 {scenario_name} 完成!")
+    print(f"  PPO最佳奖励: {ppo_eval_result['eval_results_best']['eval_reward_mean']:.4f}")
+    print(f"  PPO最后奖励: {ppo_eval_result['eval_results_last']['eval_reward_mean']:.4f}")
+    print(f"  固定分配奖励: {baseline_eval_result['baseline_results']['固定分配']['reward']:.4f}")
+    print(f"  启发式算法奖励: {baseline_eval_result['baseline_results']['启发式算法']['reward']:.4f}")
 
     return scenario_result
 

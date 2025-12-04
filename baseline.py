@@ -6,7 +6,7 @@ import csv
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Union, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
@@ -47,14 +47,28 @@ class StepTrace:
 
 @dataclass(frozen=True)
 class HeuristicConfig:
-    collision_high: float = 0.18
-    collision_medium: float = 0.1
-    backlog_high: float = 200.0
-    backlog_medium: float = 60.0
-    load_high: float = 100.0
-    load_medium: float = 50.0
-    acb_levels: Tuple[float, float, float] = (0.05, 0.15, 0.5)
-    low_collision_acb: float = 0.8
+    # Q-ALOHA 最优碰撞率和空闲率
+    optimal_collision_rate: float = 0.264  # 约 26.4%
+    optimal_idle_rate: float = 0.368       # 约 36.8%
+
+    # ACB 调整步长 (ACB 等价于 Q-ALOHA 的 q 参数，表示发送概率)
+    acb_step_up: float = 0.3      # 碰撞高时减小 ACB 的步长
+    acb_step_down: float = 0.1    # 空闲高时增大 ACB 的步长
+
+    # 碰撞率和空闲率的容忍范围
+    collision_tolerance: float = 0.05  # ±5%
+    idle_tolerance: float = 0.05       # ±5%
+
+    # 前导码分配的最小保障
+    min_preamble_per_type: int = 1
+
+    # ACB 的边界
+    acb_min: float = 0.01
+    acb_max: float = 0.95
+
+    # 当两者成功率都接近100%时的阈值
+    success_rate_threshold: float = 0.95
+
     tremble_prob: float = 0.0
 
 
@@ -66,64 +80,186 @@ class HeuristicDecision:
     acb_value: float
 
 
+@dataclass
+class HeuristicState:
+    """维护启发式策略的内部状态"""
+    last_acb: float = 0.5
+    last_cbra_preambles: int = 0
+    last_pbra_preambles: int = 0
+
+
 def encode_delta(delta: int, delta_range: int) -> int:
     clipped = int(np.clip(delta, -delta_range, delta_range))
     return clipped + delta_range
 
 
-
 def heuristic_policy(
     observation: Dict[str, np.ndarray],
+    per_slot_cfra_arrival: int,
+    preamble_allocated: Union[Tuple[int], List[int]],
     delta_range: int,
     rng: np.random.Generator,
     config: HeuristicConfig,
+    state: HeuristicState,
+    total_preambles: int = 64,
 ) -> HeuristicDecision:
-    cbra_backlog = float(observation["pending_backoff_cbra"][0])
-    pbra_backlog = float(observation["pending_backoff_pbra"][0])
+    """
+    新的启发式策略：
+    1. CFRA 优先保障：确保 CFRA >= per_slot_cfra_arrival
+    2. 剩余前导码按比例公平分配给 CBRA 和 PBRA（基于碰撞率）
+    3. 当两者成功率都接近100%时，保持上次分配，只调整 ACB
+    4. ACB 调整采用 Q-ALOHA 风格的反馈控制
+    """
+    # 提取观测值
     cbra_collision = float(observation["collision_ratio_cbra"][0])
     pbra_collision = float(observation["collision_ratio_pbra"][0])
-    cbra_requests = float(observation["requests_cbra"][0])
-    pbra_requests = float(observation["requests_pbra"][0])
 
-    cbra_delta = 0
-    pbra_delta = 0
+    # 计算成功率（假设：成功率 = 1 - 碰撞率 - 空闲率，这里简化为 1 - 碰撞率作为近似）
+    cbra_success_approx = 1.0 - cbra_collision
+    pbra_success_approx = 1.0 - pbra_collision
 
-    if cbra_collision >= config.collision_high or cbra_backlog >= config.backlog_high:
-        cbra_delta = 2
-    elif cbra_collision >= config.collision_medium or cbra_backlog >= config.backlog_medium:
-        cbra_delta = 1
-    elif cbra_collision < config.collision_medium * 0.4 and cbra_backlog < config.backlog_medium * 0.2:
-        if observation["preamble_allocation"][0] > 0.4:
-            cbra_delta = -1
+    # 当前前导码分配
+    current_cbra = int(preamble_allocated[0])
+    current_pbra = int(preamble_allocated[1])
+    # current_cfra 暂时未使用，但保留以备将来扩展
+    # current_cfra = int(preamble_allocated[2]) if len(preamble_allocated) > 2 else 0
 
-    if pbra_collision >= config.collision_high or pbra_backlog >= config.backlog_high:
-        pbra_delta = 2
-    elif pbra_collision >= config.collision_medium or pbra_backlog >= config.backlog_medium:
-        pbra_delta = 1
-    elif pbra_collision < config.collision_medium * 0.4 and pbra_backlog < config.backlog_medium * 0.2:
-        if observation["preamble_allocation"][1] > 0.4:
-            pbra_delta = -1
+    # === 第一步：确保 CFRA 前导码数量 ===
+    required_cfra = max(int(np.ceil(per_slot_cfra_arrival)), config.min_preamble_per_type)
+    target_cfra = required_cfra
 
-    load_indicator = cbra_requests + pbra_requests + cbra_backlog + pbra_backlog
-    if load_indicator >= config.load_high or max(cbra_collision, pbra_collision) >= config.collision_high:
-        acb = config.acb_levels[0]
-    elif load_indicator >= config.load_medium or max(cbra_collision, pbra_collision) >= config.collision_medium:
-        acb = config.acb_levels[1]
-    elif max(cbra_collision, pbra_collision) < config.collision_medium * 0.4:
-        acb = config.low_collision_acb
+    # 剩余可分配的前导码
+    remaining_preambles = total_preambles - target_cfra
+    remaining_preambles = max(remaining_preambles, 2 * config.min_preamble_per_type)
+
+    # === 第二步：判断是否需要重新分配 CBRA 和 PBRA ===
+    both_high_success = (
+        cbra_success_approx >= config.success_rate_threshold and
+        pbra_success_approx >= config.success_rate_threshold
+    )
+
+    if both_high_success:
+        # 两者成功率都接近100%，保持上次的前导码分配
+        target_cbra = state.last_cbra_preambles
+        target_pbra = state.last_pbra_preambles
+
+        # 确保总和不超过剩余前导码
+        if target_cbra + target_pbra > remaining_preambles:
+            ratio = remaining_preambles / max(target_cbra + target_pbra, 1)
+            target_cbra = int(target_cbra * ratio)
+            target_pbra = remaining_preambles - target_cbra
+
+            # 重新应用最小前导码约束
+            target_cbra = max(target_cbra, config.min_preamble_per_type)
+            target_pbra = max(target_pbra, config.min_preamble_per_type)
+
+            # 如果仍超出，优先保证最小值，然后按比例分配剩余
+            if target_cbra + target_pbra > remaining_preambles:
+                min_total = 2 * config.min_preamble_per_type
+                if remaining_preambles >= min_total:
+                    target_cbra = config.min_preamble_per_type
+                    target_pbra = remaining_preambles - target_cbra
+                else:
+                    # 极端情况：连最小值都无法满足
+                    target_cbra = remaining_preambles // 2
+                    target_pbra = remaining_preambles - target_cbra
     else:
-        acb = config.acb_levels[2]
+        # 基于碰撞率进行比例公平分配
+        # 碰撞率越高，需要的前导码越多
+        # 使用碰撞率的倒数作为权重（碰撞率低的系统效率高，可以用更少的前导码）
 
+        # 为了避免除零，添加一个小的 epsilon
+        epsilon = 0.01
+        cbra_weight = cbra_collision + epsilon
+        pbra_weight = pbra_collision + epsilon
+
+        total_weight = cbra_weight + pbra_weight
+
+        # 按比例分配
+        cbra_ratio = cbra_weight / total_weight
+
+        target_cbra = int(cbra_ratio * remaining_preambles)
+        target_pbra = remaining_preambles - target_cbra
+
+        # 确保最小前导码数量
+        target_cbra = max(target_cbra, config.min_preamble_per_type)
+        target_pbra = max(target_pbra, config.min_preamble_per_type)
+
+        # 如果超出剩余前导码，按比例缩减
+        if target_cbra + target_pbra > remaining_preambles:
+            total_target = target_cbra + target_pbra
+            target_cbra = int((target_cbra / total_target) * remaining_preambles)
+            target_pbra = remaining_preambles - target_cbra
+
+            # 重新应用最小前导码约束
+            target_cbra = max(target_cbra, config.min_preamble_per_type)
+            target_pbra = max(target_pbra, config.min_preamble_per_type)
+
+            # 如果仍超出，优先保证最小值，然后按比例分配剩余
+            if target_cbra + target_pbra > remaining_preambles:
+                min_total = 2 * config.min_preamble_per_type
+                if remaining_preambles >= min_total:
+                    target_cbra = config.min_preamble_per_type
+                    target_pbra = remaining_preambles - target_cbra
+                else:
+                    # 极端情况：连最小值都无法满足
+                    target_cbra = remaining_preambles // 2
+                    target_pbra = remaining_preambles - target_cbra
+    # print(f'target_cbra {target_cbra} target_pbra {target_pbra} target_cfra {target_cfra}')
+    # 计算 delta
+    cbra_delta = target_cbra - current_cbra
+    pbra_delta = target_pbra - current_pbra
+    # print(f'cbra_delta {cbra_delta} pbra_delta {pbra_delta}')
+    # === 第三步：调整 ACB (Access Control Barring) ===
+    # 注意：在本系统中，ACB 表示"允许接入的比例"，等价于 Q-ALOHA 的 q 参数
+    #       ACB = q (发送概率)
+    #       ACB = 1.0 → 所有终端都尝试接入（100% 发送概率）
+    #       ACB = 0.0 → 没有终端尝试接入（0% 发送概率）
+    #
+    # Q-ALOHA 调整准则：
+    # - 碰撞率高 → 竞争激烈 → 减小 ACB（降低发送概率，减少接入数量）
+    # - 碰撞率低（空闲率高）→ 资源浪费 → 增大 ACB（提高发送概率，增加接入数量）
+    # - 目标：收敛到最优碰撞率约 26.4%
+
+    # 计算综合碰撞率（加权平均）
+    total_active_preambles = max(current_cbra + current_pbra, 1)
+    weighted_collision = (
+        (current_cbra / total_active_preambles) * cbra_collision +
+        (current_pbra / total_active_preambles) * pbra_collision
+    )
+
+    # Q-ALOHA 调整逻辑
+    acb = state.last_acb
+
+    if weighted_collision > config.optimal_collision_rate + config.collision_tolerance:
+        # 碰撞率过高，降低 ACB（限制更多接入）
+        acb = acb - config.acb_step_up
+    elif weighted_collision < config.optimal_collision_rate - config.collision_tolerance:
+        # 碰撞率过低（可能空闲率高），提高 ACB（允许更多接入）
+        acb = acb + config.acb_step_down
+    # else: 在最优范围内，保持不变
+
+    # 边界限制
+    acb = float(np.clip(acb, config.acb_min, config.acb_max))
+
+    # === 第四步：添加探索噪声（可选）===
     if rng.random() < config.tremble_prob:
         cbra_delta += rng.integers(-1, 2)
         pbra_delta += rng.integers(-1, 2)
 
+    # 更新状态
+    state.last_acb = acb
+    state.last_cbra_preambles = target_cbra
+    state.last_pbra_preambles = target_pbra
+
+    # 构造动作
     action_dict = {
-        "delta_cbra": np.array(encode_delta(cbra_delta, delta_range), dtype=np.int64),
-        "delta_pbra": np.array(encode_delta(pbra_delta, delta_range), dtype=np.int64),
-        "q_ACB": np.array([np.clip(acb, 0.0, 1.0)], dtype=np.float32),
+        "delta_cbra": np.array(cbra_delta, dtype=np.int64),
+        "delta_pbra": np.array(pbra_delta, dtype=np.int64),
+        "q_ACB": np.array([acb], dtype=np.float32),
     }
-    return HeuristicDecision(action_dict, cbra_delta, pbra_delta, float(acb))
+
+    return HeuristicDecision(action_dict, cbra_delta, pbra_delta, acb)
 
 
 def validate_info(info: Dict[str, object]) -> None:
@@ -147,7 +283,8 @@ def run_episode(
     seed: int,
     fix: bool = False,
     fix_acb: float = 0.5,
-    preamble_init: tuple = (40, 14, 10)
+    preamble_init: tuple = (40, 14, 10),
+    total_preambles: int = 64,
 ) -> Tuple[EpisodeStats, Dict[str, object], List[StepTrace]]:
     observation, info = env.reset(seed=seed)
     validate_info(info)
@@ -155,18 +292,37 @@ def run_episode(
     last_info = info
     traces: List[StepTrace] = []
     heuristic_cfg = HeuristicConfig()
+    heuristic_state = HeuristicState(
+        last_acb=fix_acb,
+        last_cbra_preambles=preamble_init[0],
+        last_pbra_preambles=preamble_init[1],
+    )
     done = False
     env.simulator.configure_access_state(cbra=preamble_init[0],
                                          pbra=preamble_init[1],
                                          cfra=preamble_init[2],)
     num_slots_per_step = env.unwrapped.config.num_slots_per_step
+
     last_cfra_total_arrivals_cfra = 0
     while not done:
         cur_cfra_total_arrivals_cfra = env.unwrapped.simulator._total_arrivals_cfra
-        last_arrial_cfra = cur_cfra_total_arrivals_cfra - last_cfra_total_arrivals_cfra
+        last_arrival_cfra = cur_cfra_total_arrivals_cfra - last_cfra_total_arrivals_cfra
+        last_arrival_cfra_per_slot_avg = np.ceil(last_arrival_cfra / num_slots_per_step)
         last_cfra_total_arrivals_cfra = cur_cfra_total_arrivals_cfra
+        cur_preamble_allocation = env.unwrapped.simulator._preamble_allocation
+        # print('cur_preamble_allocation',cur_preamble_allocation)
         if not fix:
-            decision = heuristic_policy(observation, delta_range, rng, heuristic_cfg)
+            decision = heuristic_policy(
+                observation,
+                last_arrival_cfra_per_slot_avg,
+                cur_preamble_allocation,
+                delta_range,
+                rng,
+                heuristic_cfg,
+                heuristic_state,
+                total_preambles,
+            )
+
         else:
             action_dict = {
                 "delta_cbra": np.array([0], dtype=np.int64),
@@ -174,7 +330,7 @@ def run_episode(
                 "q_ACB": np.array([fix_acb], dtype=np.float32),
             }
             decision = HeuristicDecision(action_dict, 0, 0, fix_acb)
-
+        # print('decision', decision)
         observation, reward, terminated, truncated, info = env.step(decision.action, need_parse_action=False)
         validate_info(info)
 
