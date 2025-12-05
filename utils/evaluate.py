@@ -211,7 +211,8 @@ def run_baseline_comparison(
     run_episode_func,
     num_episodes: int = 20,
     seed: int = None,
-    fix_acb: float = 0.2
+    fix_acb: float = 0.2,
+    preamble_init: tuple = (24,24,16)
 ) -> Dict[str, Dict]:
     """运行基线策略对比（固定分配和启发式算法）
 
@@ -246,7 +247,7 @@ def run_baseline_comparison(
             episode_seed = int(baseline_rng.integers(0, 1_000_000))
             stats, last_info, _ = run_episode_func(
                 baseline_env, delta_range, baseline_rng, episode_seed,
-                fix=fix, fix_acb=fix_acb
+                fix=fix, fix_acb=fix_acb, preamble_init=preamble_init
             )
 
             arrivals_cbra = float(_scalar(last_info, "total_arrivals_cbra", 0.0))
@@ -479,7 +480,8 @@ def evaluate_scenario_baseline(
     run_episode_func,
     num_episodes: int = 20,
     seed: int = None,
-    fix_acb: float = 0.2
+    fix_acb: float = 0.2,
+    preamble_init: tuple = (24,24,16)
 ) -> Dict:
     """评估baseline策略（固定分配和启发式）
 
@@ -501,7 +503,8 @@ def evaluate_scenario_baseline(
         run_episode_func=run_episode_func,
         num_episodes=num_episodes,
         seed=seed,
-        fix_acb=fix_acb
+        fix_acb=fix_acb,
+        preamble_init=preamble_init
     )
 
     print(f"  固定分配奖励: {baseline_results['固定分配']['reward']:.4f}")

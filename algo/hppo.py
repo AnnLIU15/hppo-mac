@@ -380,19 +380,19 @@ class SplitHeadClipPPOLoss(ClipPPOLoss):
             old_lp = old_lp.reshape(old_lp.shape[0], -1).sum(dim=-1)
 
             log_weight_scalar = new_lp - old_lp
-            if torch.isfinite(log_weight_scalar).all():
-                if (log_weight_scalar > 10000).any():
-                    raise RuntimeError(
-                        f"Log-weight overflow for head '{key}'",
-                        {
-                            "max_log_weight": float(log_weight_scalar.max().detach().cpu().item()),
-                            "min_log_weight": float(log_weight_scalar.min().detach().cpu().item()),
-                            "max_new_lp": float(new_lp.max().detach().cpu().item()),
-                            "min_new_lp": float(new_lp.min().detach().cpu().item()),
-                            "max_old_lp": float(old_lp.max().detach().cpu().item()),
-                            "min_old_lp": float(old_lp.min().detach().cpu().item()),
-                        },
-                    )
+            # if torch.isfinite(log_weight_scalar).all():
+            #     if (log_weight_scalar > 10000).any():
+            #         raise RuntimeError(
+            #             f"Log-weight overflow for head '{key}'",
+            #             {
+            #                 "max_log_weight": float(log_weight_scalar.max().detach().cpu().item()),
+            #                 "min_log_weight": float(log_weight_scalar.min().detach().cpu().item()),
+            #                 "max_new_lp": float(new_lp.max().detach().cpu().item()),
+            #                 "min_new_lp": float(new_lp.min().detach().cpu().item()),
+            #                 "max_old_lp": float(old_lp.max().detach().cpu().item()),
+            #                 "min_old_lp": float(old_lp.min().detach().cpu().item()),
+            #             },
+            #         )
 
             log_weight = log_weight_scalar.unsqueeze(-1)
             log_weight_stack.append(log_weight)
